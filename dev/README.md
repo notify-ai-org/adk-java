@@ -1,1 +1,0 @@
-ADK development utilities such as Spring REST server for agent.

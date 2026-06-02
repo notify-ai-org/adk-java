@@ -1,0 +1,422 @@
+package com.google.adk.models;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.google.adk.JsonBaseModel;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import com.google.genai.Client;
+import com.google.genai.types.Content;
+import com.google.genai.types.FunctionCall;
+import com.google.genai.types.FunctionDeclaration;
+import com.google.genai.types.GenerateContentConfig;
+import com.google.genai.types.HttpOptions;
+import com.google.genai.types.Part;
+import com.openai.client.OpenAIClient;
+import com.openai.client.okhttp.OpenAIOkHttpClient;
+import com.openai.core.JsonValue;
+import com.openai.models.FunctionDefinition;
+import com.openai.models.FunctionParameters;
+import com.openai.models.chat.completions.ChatCompletion;
+import com.openai.models.chat.completions.ChatCompletionAssistantMessageParam;
+import com.openai.models.chat.completions.ChatCompletionCreateParams;
+import com.openai.models.chat.completions.ChatCompletionMessage;
+import com.openai.models.chat.completions.ChatCompletionMessageFunctionToolCall;
+import com.openai.models.chat.completions.ChatCompletionMessageParam;
+import com.openai.models.chat.completions.ChatCompletionMessageToolCall;
+import com.openai.models.chat.completions.ChatCompletionSystemMessageParam;
+import com.openai.models.chat.completions.ChatCompletionTool;
+import com.openai.models.chat.completions.ChatCompletionToolChoiceOption;
+import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
+import com.openai.models.chat.completions.ChatCompletionUserMessageParam;
+import io.reactivex.rxjava3.core.Flowable;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Represents the OpenAI Generative AI model.
+ *
+ * <p>
+ * This class provides methods for interacting with OpenAI models via the Chat
+ * Completions API.
+ * Streaming and live connections are not currently supported.
+ */
+public class OpenAILlm extends BaseLlm {
+
+  private static final Logger logger = LoggerFactory.getLogger(OpenAILlm.class);
+  private int maxTokens = 8192;
+  private final OpenAIClient client;
+
+  /**
+   * Constructs a new OpenAILlm instance.
+   *
+   * @param model  The name of the OpenAI model to use (e.g., "gpt-4o").
+   * @param client The OpenAI API client instance.
+   */
+  public OpenAILlm(String model, OpenAIClient client) {
+    super(model);
+    this.client = client;
+  }
+
+  public OpenAILlm(String model, OpenAIClient client, int maxTokens) {
+    super(model);
+    this.client = client;
+    this.maxTokens = maxTokens;
+  }
+
+  public OpenAILlm(String model) {
+    super(model);
+    this.maxTokens = 8192;
+    OpenAIClient client = OpenAIOkHttpClient.fromEnv();
+    this.client = client;
+  }
+
+  @Override
+  public Flowable<LlmResponse> generateContent(LlmRequest llmRequest, boolean stream) {
+    // Build the list of messages from the ADK Content objects.
+    List<ChatCompletionMessageParam> messages = new ArrayList<>();
+
+    // Extract system instruction and add as a system message.
+    String systemText = "";
+    Optional<GenerateContentConfig> configOpt = llmRequest.config();
+    if (configOpt.isPresent()) {
+      Optional<Content> systemInstructionOpt = configOpt.get().systemInstruction();
+      if (systemInstructionOpt.isPresent()) {
+        String extractedSystemText = systemInstructionOpt.get().parts().orElse(ImmutableList.of()).stream()
+            .filter(p -> p.text().isPresent())
+            .map(p -> p.text().get())
+            .collect(Collectors.joining("\n"));
+        if (!extractedSystemText.isEmpty()) {
+          systemText = extractedSystemText;
+        }
+      }
+    }
+
+    if (!systemText.isEmpty()) {
+      messages.add(
+          ChatCompletionMessageParam.ofSystem(
+              ChatCompletionSystemMessageParam.builder().content(systemText).build()));
+    }
+
+    // Convert each ADK Content to an OpenAI ChatCompletionMessageParam.
+    for (Content content : llmRequest.contents()) {
+      ChatCompletionMessageParam messageParam = contentToOpenAIMessageParam(content);
+      if (messageParam != null) {
+        messages.add(messageParam);
+      }
+    }
+
+    // Convert ADK function declarations to OpenAI tools.
+    List<ChatCompletionTool> tools = ImmutableList.of();
+    if (llmRequest.config().isPresent()
+        && llmRequest.config().get().tools().isPresent()
+        && !llmRequest.config().get().tools().get().isEmpty()
+        && llmRequest.config().get().tools().get().get(0).functionDeclarations().isPresent()) {
+      tools = llmRequest.config().get().tools().get().get(0).functionDeclarations().get().stream()
+          .map(this::functionDeclarationToOpenAITool)
+          .collect(Collectors.toList());
+    }
+
+    // Build the request params.
+    ChatCompletionCreateParams.Builder paramsBuilder = ChatCompletionCreateParams.builder()
+        .model(llmRequest.model().orElse(model()))
+        .messages(messages)
+        .maxTokens((long) this.maxTokens);
+
+    if (!tools.isEmpty()) {
+      paramsBuilder.tools(tools);
+      paramsBuilder.toolChoice(ChatCompletionToolChoiceOption.Auto.AUTO);
+      paramsBuilder.parallelToolCalls(false);
+    }
+
+    ChatCompletion completion = client.chat().completions().create(paramsBuilder.build());
+
+    logger.debug("OpenAI response: {}", completion);
+
+    return Flowable.just(convertOpenAIResponseToLlmResponse(completion));
+  }
+
+  private ChatCompletionMessageParam contentToOpenAIMessageParam(Content content) {
+    String role = content.role().orElse("");
+    List<Part> parts = content.parts().orElse(ImmutableList.of());
+
+    // Check if this content has function calls (assistant message with tool_use).
+    boolean hasFunctionCall = parts.stream().anyMatch(p -> p.functionCall().isPresent());
+    // Check if this content has function responses (tool results).
+    boolean hasFunctionResponse = parts.stream().anyMatch(p -> p.functionResponse().isPresent());
+
+    if (hasFunctionCall) {
+      // Build an assistant message with tool calls.
+      String textContent = parts.stream()
+          .filter(p -> p.text().isPresent())
+          .map(p -> p.text().get())
+          .collect(Collectors.joining("\n"));
+
+      List<ChatCompletionMessageToolCall> toolCalls = parts.stream()
+          .filter(p -> p.functionCall().isPresent())
+          .map(
+              p -> {
+                FunctionCall fc = p.functionCall().get();
+                String argsJson = serializeToJson(fc.args().orElse(ImmutableMap.of()));
+                return ChatCompletionMessageToolCall.ofFunction(
+                    ChatCompletionMessageFunctionToolCall.builder()
+                        .id(fc.id().orElse(""))
+                        .function(
+                            ChatCompletionMessageFunctionToolCall.Function.builder()
+                                .name(fc.name().orElseThrow())
+                                .arguments(argsJson)
+                                .build())
+                        .build());
+              })
+          .collect(Collectors.toList());
+
+      ChatCompletionAssistantMessageParam.Builder assistantBuilder = ChatCompletionAssistantMessageParam.builder()
+          .toolCalls(toolCalls);
+
+      if (!textContent.isEmpty()) {
+        assistantBuilder.content(textContent);
+      }
+
+      return ChatCompletionMessageParam.ofAssistant(assistantBuilder.build());
+    } else if (hasFunctionResponse) {
+      // Each function response becomes a separate tool message.
+      // Return the first one; if there are multiple, they should be separate
+      // messages.
+      // For simplicity, return the first function response as a tool message.
+      for (Part p : parts) {
+        if (p.functionResponse().isPresent()) {
+          String responseContent = "";
+          if (p.functionResponse().get().response().isPresent()) {
+            Map<String, Object> responseData = p.functionResponse().get().response().get();
+            Object resultObj = responseData.get("result");
+            if (resultObj != null) {
+              responseContent = resultObj.toString();
+            } else {
+              responseContent = serializeToJson(responseData);
+            }
+          }
+          return ChatCompletionMessageParam.ofTool(
+              ChatCompletionToolMessageParam.builder()
+                  .toolCallId(p.functionResponse().get().id().orElse(""))
+                  .content(responseContent)
+                  .build());
+        }
+      }
+    }
+
+    // Regular text message: determine role.
+    String textContent = parts.stream()
+        .filter(p -> p.text().isPresent())
+        .map(p -> p.text().get())
+        .collect(Collectors.joining("\n"));
+
+    if (role.equals("model") || role.equals("assistant")) {
+      return ChatCompletionMessageParam.ofAssistant(
+          ChatCompletionAssistantMessageParam.builder().content(textContent).build());
+    } else {
+      return ChatCompletionMessageParam.ofUser(
+          ChatCompletionUserMessageParam.builder().content(textContent).build());
+    }
+  }
+
+  private String serializeToJson(Object obj) {
+    try {
+      return JsonBaseModel.getMapper().writeValueAsString(obj);
+    } catch (Exception e) {
+      logger.warn("Failed to serialize object to JSON", e);
+      return String.valueOf(obj);
+    }
+  }
+
+  private void updateTypeString(Map<String, Object> valueDict) {
+    if (valueDict == null) {
+      return;
+    }
+    if (valueDict.containsKey("type")) {
+      valueDict.put("type", ((String) valueDict.get("type")).toLowerCase());
+    }
+
+    if (valueDict.containsKey("items")) {
+      updateTypeString((Map<String, Object>) valueDict.get("items"));
+
+      if (valueDict.get("items") instanceof Map
+          && ((Map) valueDict.get("items")).containsKey("properties")) {
+        Map<String, Object> properties = (Map<String, Object>) ((Map) valueDict.get("items")).get("properties");
+        if (properties != null) {
+          for (Object value : properties.values()) {
+            if (value instanceof Map) {
+              updateTypeString((Map<String, Object>) value);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private ChatCompletionTool functionDeclarationToOpenAITool(
+      FunctionDeclaration functionDeclaration) {
+    Map<String, Map<String, Object>> properties = new HashMap<>();
+    if (functionDeclaration.parameters().isPresent()
+        && functionDeclaration.parameters().get().properties().isPresent()) {
+      functionDeclaration
+          .parameters()
+          .get()
+          .properties()
+          .get()
+          .forEach(
+              (key, schema) -> {
+                Map<String, Object> schemaMap = JsonBaseModel.getMapper()
+                    .convertValue(schema, new TypeReference<Map<String, Object>>() {
+                    });
+                updateTypeString(schemaMap);
+                properties.put(key, schemaMap);
+              });
+    }
+
+    FunctionParameters.Builder paramsBuilder = FunctionParameters.builder();
+    paramsBuilder.putAdditionalProperty("type", JsonValue.from("object"));
+    paramsBuilder.putAdditionalProperty("properties", JsonValue.from(properties));
+
+    return ChatCompletionTool.ofFunction(
+        com.openai.models.chat.completions.ChatCompletionFunctionTool.builder()
+            .function(
+                FunctionDefinition.builder()
+                    .name(functionDeclaration.name().orElseThrow())
+                    .description(functionDeclaration.description().orElse(""))
+                    .parameters(paramsBuilder.build())
+                    .build())
+            .build());
+  }
+
+  private LlmResponse convertOpenAIResponseToLlmResponse(ChatCompletion completion) {
+    LlmResponse.Builder responseBuilder = LlmResponse.builder();
+    List<Part> parts = new ArrayList<>();
+
+    if (completion.choices() != null && !completion.choices().isEmpty()) {
+      ChatCompletionMessage message = completion.choices().get(0).message();
+
+      // Handle text content.
+      if (message.content().isPresent()) {
+        parts.add(Part.builder().text(message.content().get()).build());
+      }
+
+      // Handle tool calls.
+      if (message.toolCalls().isPresent()) {
+        for (ChatCompletionMessageToolCall toolCall : message.toolCalls().get()) {
+          if (toolCall.isFunction()) {
+            ChatCompletionMessageFunctionToolCall functionToolCall = toolCall.asFunction();
+            Map<String, Object> args;
+            try {
+              args = JsonBaseModel.getMapper()
+                  .readValue(
+                      functionToolCall.function().arguments(),
+                      new TypeReference<Map<String, Object>>() {
+                      });
+            } catch (Exception e) {
+              logger.warn("Failed to parse function arguments as JSON", e);
+              args = ImmutableMap.of();
+            }
+            parts.add(
+                Part.builder()
+                    .functionCall(
+                        FunctionCall.builder()
+                            .id(functionToolCall.id())
+                            .name(functionToolCall.function().name())
+                            .args(args)
+                            .build())
+                    .build());
+          }
+        }
+      }
+
+      if (!parts.isEmpty()) {
+        responseBuilder.content(
+            Content.builder().role("model").parts(ImmutableList.copyOf(parts)).build());
+      }
+    }
+    return responseBuilder.build();
+  }
+
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  public static class Builder {
+    private String modelName;
+    private OpenAIClient apiClient;
+    private int maxTokens;
+
+    private Builder() {
+    }
+
+    /**
+     * Sets the name of the OpenAI model to use.
+     *
+     * @param modelName The model name (e.g., "gpt-4o").
+     * @return This builder.
+     */
+    @CanIgnoreReturnValue
+    public Builder modelName(String modelName) {
+      this.modelName = modelName;
+      return this;
+    }
+
+    /**
+     * Sets the explicit {@link com.op} instance for making API calls. If this is
+     * set, apiKey and vertexCredentials will be ignored.
+     *
+     * @param apiClient The client instance.
+     * @return This builder.
+     */
+    @CanIgnoreReturnValue
+    public Builder apiClient(OpenAIClient apiClient) {
+      this.apiClient = apiClient;
+      return this;
+    }
+
+    /**
+     * Sets the maximum number of tokens to generate. If {@link #apiClient(Client)}
+     * is also set,
+     * the explicit client will take precedence. If
+     * {@link #vertexCredentials(VertexCredentials)} is also set,
+     * this apiKey will take precedence.
+     *
+     * @param maxTokens The maximum number of tokens to generate.
+     * @return This builder.
+     */
+    @CanIgnoreReturnValue
+    public Builder maxTokens(int maxTokens) {
+      this.maxTokens = maxTokens;
+      return this;
+    }
+
+    /**
+     * Builds the {@link Gemini} instance.
+     *
+     * @return A new {@link Gemini} instance.
+     * @throws NullPointerException if modelName is null.
+     */
+    public OpenAILlm build() {
+      Objects.requireNonNull(modelName, "modelName must be set.");
+      if (apiClient != null) {
+        return new OpenAILlm(modelName, apiClient);
+      } else {
+        return new OpenAILlm(
+            modelName, OpenAIOkHttpClient.fromEnv());
+      }
+    }
+
+  }
+
+  @Override
+  public BaseLlmConnection connect(LlmRequest llmRequest) {
+    throw new UnsupportedOperationException("Live connection is not supported for OpenAI models.");
+  }
+}

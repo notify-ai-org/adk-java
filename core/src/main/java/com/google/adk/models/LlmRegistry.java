@@ -40,23 +40,26 @@ public final class LlmRegistry {
     registerLlm("gemini-.*", modelName -> Gemini.builder().modelName(modelName).build());
     registerLlm("apigee/.*", modelName -> ApigeeLlm.builder().modelName(modelName).build());
     registerLlm("gemma-.*", modelName -> Gemini.builder().modelName(modelName).build());
+    registerLlm("gpt-.*", modelName -> OpenAILlm.builder().modelName(modelName).build());
   }
 
   /**
    * Registers a factory for model names matching the given regex pattern.
    *
    * @param modelNamePattern Regex pattern for matching model names.
-   * @param factory Factory to create LLM instances.
+   * @param factory          Factory to create LLM instances.
    */
   public static void registerLlm(String modelNamePattern, LlmFactory factory) {
     llmFactories.put(modelNamePattern, factory);
   }
 
   /**
-   * Checks if the given model name matches any of the registered LLM factory patterns.
+   * Checks if the given model name matches any of the registered LLM factory
+   * patterns.
    *
    * @param modelName The model name to check.
-   * @return {@code true} if the model name matches at least one pattern, {@code false} otherwise.
+   * @return {@code true} if the model name matches at least one pattern,
+   *         {@code false} otherwise.
    */
   @VisibleForTesting
   static boolean matchesAnyPattern(String modelName) {
@@ -64,7 +67,8 @@ public final class LlmRegistry {
   }
 
   /**
-   * Returns an LLM instance for the given model name, using a cached or new factory-created
+   * Returns an LLM instance for the given model name, using a cached or new
+   * factory-created
    * instance.
    *
    * @param modelName Model name to look up.
@@ -76,7 +80,8 @@ public final class LlmRegistry {
   }
 
   /**
-   * Creates a {@link BaseLlm} by matching the model name against registered factories.
+   * Creates a {@link BaseLlm} by matching the model name against registered
+   * factories.
    *
    * @param modelName Model name to match.
    * @return A new {@link BaseLlm} instance.
@@ -92,11 +97,12 @@ public final class LlmRegistry {
   }
 
   /**
-   * Registers an LLM factory for testing purposes. Clears cached instances matching the given
+   * Registers an LLM factory for testing purposes. Clears cached instances
+   * matching the given
    * pattern to ensure test isolation.
    *
    * @param modelNamePattern Regex pattern for matching model names.
-   * @param factory The {@link LlmFactory} to register.
+   * @param factory          The {@link LlmFactory} to register.
    */
   static void registerTestLlm(String modelNamePattern, LlmFactory factory) {
     llmFactories.put(modelNamePattern, factory);
@@ -104,5 +110,6 @@ public final class LlmRegistry {
     instances.keySet().removeIf(modelName -> modelName.matches(modelNamePattern));
   }
 
-  private LlmRegistry() {}
+  private LlmRegistry() {
+  }
 }

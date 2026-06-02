@@ -48,13 +48,13 @@ If you're using Maven, add the following to your dependencies:
 
 ```xml
 <dependency>
-  <groupId>com.google.adk</groupId>
+  <groupId>com.notify</groupId>
   <artifactId>google-adk</artifactId>
   <version>1.3.0</version>
 </dependency>
 <!-- Dev UI -->
 <dependency>
-    <groupId>com.google.adk</groupId>
+    <groupId>com.notify</groupId>
     <artifactId>google-adk-dev</artifactId>
     <version>1.3.0</version>
 </dependency>
