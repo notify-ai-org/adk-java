@@ -10,7 +10,6 @@ import com.google.genai.types.Content;
 import com.google.genai.types.FunctionCall;
 import com.google.genai.types.FunctionDeclaration;
 import com.google.genai.types.GenerateContentConfig;
-import com.google.genai.types.HttpOptions;
 import com.google.genai.types.Part;
 import com.openai.client.OpenAIClient;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
@@ -43,9 +42,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Represents the OpenAI Generative AI model.
  *
- * <p>
- * This class provides methods for interacting with OpenAI models via the Chat
- * Completions API.
+ * <p>This class provides methods for interacting with OpenAI models via the Chat Completions API.
  * Streaming and live connections are not currently supported.
  */
 public class OpenAILlm extends BaseLlm {
@@ -57,7 +54,7 @@ public class OpenAILlm extends BaseLlm {
   /**
    * Constructs a new OpenAILlm instance.
    *
-   * @param model  The name of the OpenAI model to use (e.g., "gpt-4o").
+   * @param model The name of the OpenAI model to use (e.g., "gpt-4o").
    * @param client The OpenAI API client instance.
    */
   public OpenAILlm(String model, OpenAIClient client) {
@@ -89,10 +86,11 @@ public class OpenAILlm extends BaseLlm {
     if (configOpt.isPresent()) {
       Optional<Content> systemInstructionOpt = configOpt.get().systemInstruction();
       if (systemInstructionOpt.isPresent()) {
-        String extractedSystemText = systemInstructionOpt.get().parts().orElse(ImmutableList.of()).stream()
-            .filter(p -> p.text().isPresent())
-            .map(p -> p.text().get())
-            .collect(Collectors.joining("\n"));
+        String extractedSystemText =
+            systemInstructionOpt.get().parts().orElse(ImmutableList.of()).stream()
+                .filter(p -> p.text().isPresent())
+                .map(p -> p.text().get())
+                .collect(Collectors.joining("\n"));
         if (!extractedSystemText.isEmpty()) {
           systemText = extractedSystemText;
         }
@@ -119,16 +117,18 @@ public class OpenAILlm extends BaseLlm {
         && llmRequest.config().get().tools().isPresent()
         && !llmRequest.config().get().tools().get().isEmpty()
         && llmRequest.config().get().tools().get().get(0).functionDeclarations().isPresent()) {
-      tools = llmRequest.config().get().tools().get().get(0).functionDeclarations().get().stream()
-          .map(this::functionDeclarationToOpenAITool)
-          .collect(Collectors.toList());
+      tools =
+          llmRequest.config().get().tools().get().get(0).functionDeclarations().get().stream()
+              .map(this::functionDeclarationToOpenAITool)
+              .collect(Collectors.toList());
     }
 
     // Build the request params.
-    ChatCompletionCreateParams.Builder paramsBuilder = ChatCompletionCreateParams.builder()
-        .model(llmRequest.model().orElse(model()))
-        .messages(messages)
-        .maxTokens((long) this.maxTokens);
+    ChatCompletionCreateParams.Builder paramsBuilder =
+        ChatCompletionCreateParams.builder()
+            .model(llmRequest.model().orElse(model()))
+            .messages(messages)
+            .maxTokens((long) this.maxTokens);
 
     if (!tools.isEmpty()) {
       paramsBuilder.tools(tools);
@@ -154,31 +154,33 @@ public class OpenAILlm extends BaseLlm {
 
     if (hasFunctionCall) {
       // Build an assistant message with tool calls.
-      String textContent = parts.stream()
-          .filter(p -> p.text().isPresent())
-          .map(p -> p.text().get())
-          .collect(Collectors.joining("\n"));
+      String textContent =
+          parts.stream()
+              .filter(p -> p.text().isPresent())
+              .map(p -> p.text().get())
+              .collect(Collectors.joining("\n"));
 
-      List<ChatCompletionMessageToolCall> toolCalls = parts.stream()
-          .filter(p -> p.functionCall().isPresent())
-          .map(
-              p -> {
-                FunctionCall fc = p.functionCall().get();
-                String argsJson = serializeToJson(fc.args().orElse(ImmutableMap.of()));
-                return ChatCompletionMessageToolCall.ofFunction(
-                    ChatCompletionMessageFunctionToolCall.builder()
-                        .id(fc.id().orElse(""))
-                        .function(
-                            ChatCompletionMessageFunctionToolCall.Function.builder()
-                                .name(fc.name().orElseThrow())
-                                .arguments(argsJson)
-                                .build())
-                        .build());
-              })
-          .collect(Collectors.toList());
+      List<ChatCompletionMessageToolCall> toolCalls =
+          parts.stream()
+              .filter(p -> p.functionCall().isPresent())
+              .map(
+                  p -> {
+                    FunctionCall fc = p.functionCall().get();
+                    String argsJson = serializeToJson(fc.args().orElse(ImmutableMap.of()));
+                    return ChatCompletionMessageToolCall.ofFunction(
+                        ChatCompletionMessageFunctionToolCall.builder()
+                            .id(fc.id().orElse(""))
+                            .function(
+                                ChatCompletionMessageFunctionToolCall.Function.builder()
+                                    .name(fc.name().orElseThrow())
+                                    .arguments(argsJson)
+                                    .build())
+                            .build());
+                  })
+              .collect(Collectors.toList());
 
-      ChatCompletionAssistantMessageParam.Builder assistantBuilder = ChatCompletionAssistantMessageParam.builder()
-          .toolCalls(toolCalls);
+      ChatCompletionAssistantMessageParam.Builder assistantBuilder =
+          ChatCompletionAssistantMessageParam.builder().toolCalls(toolCalls);
 
       if (!textContent.isEmpty()) {
         assistantBuilder.content(textContent);
@@ -212,10 +214,11 @@ public class OpenAILlm extends BaseLlm {
     }
 
     // Regular text message: determine role.
-    String textContent = parts.stream()
-        .filter(p -> p.text().isPresent())
-        .map(p -> p.text().get())
-        .collect(Collectors.joining("\n"));
+    String textContent =
+        parts.stream()
+            .filter(p -> p.text().isPresent())
+            .map(p -> p.text().get())
+            .collect(Collectors.joining("\n"));
 
     if (role.equals("model") || role.equals("assistant")) {
       return ChatCompletionMessageParam.ofAssistant(
@@ -248,7 +251,8 @@ public class OpenAILlm extends BaseLlm {
 
       if (valueDict.get("items") instanceof Map
           && ((Map) valueDict.get("items")).containsKey("properties")) {
-        Map<String, Object> properties = (Map<String, Object>) ((Map) valueDict.get("items")).get("properties");
+        Map<String, Object> properties =
+            (Map<String, Object>) ((Map) valueDict.get("items")).get("properties");
         if (properties != null) {
           for (Object value : properties.values()) {
             if (value instanceof Map) {
@@ -272,9 +276,9 @@ public class OpenAILlm extends BaseLlm {
           .get()
           .forEach(
               (key, schema) -> {
-                Map<String, Object> schemaMap = JsonBaseModel.getMapper()
-                    .convertValue(schema, new TypeReference<Map<String, Object>>() {
-                    });
+                Map<String, Object> schemaMap =
+                    JsonBaseModel.getMapper()
+                        .convertValue(schema, new TypeReference<Map<String, Object>>() {});
                 updateTypeString(schemaMap);
                 properties.put(key, schemaMap);
               });
@@ -314,11 +318,11 @@ public class OpenAILlm extends BaseLlm {
             ChatCompletionMessageFunctionToolCall functionToolCall = toolCall.asFunction();
             Map<String, Object> args;
             try {
-              args = JsonBaseModel.getMapper()
-                  .readValue(
-                      functionToolCall.function().arguments(),
-                      new TypeReference<Map<String, Object>>() {
-                      });
+              args =
+                  JsonBaseModel.getMapper()
+                      .readValue(
+                          functionToolCall.function().arguments(),
+                          new TypeReference<Map<String, Object>>() {});
             } catch (Exception e) {
               logger.warn("Failed to parse function arguments as JSON", e);
               args = ImmutableMap.of();
@@ -353,8 +357,7 @@ public class OpenAILlm extends BaseLlm {
     private OpenAIClient apiClient;
     private int maxTokens;
 
-    private Builder() {
-    }
+    private Builder() {}
 
     /**
      * Sets the name of the OpenAI model to use.
@@ -369,8 +372,8 @@ public class OpenAILlm extends BaseLlm {
     }
 
     /**
-     * Sets the explicit {@link com.op} instance for making API calls. If this is
-     * set, apiKey and vertexCredentials will be ignored.
+     * Sets the explicit {@link com.op} instance for making API calls. If this is set, apiKey and
+     * vertexCredentials will be ignored.
      *
      * @param apiClient The client instance.
      * @return This builder.
@@ -382,11 +385,9 @@ public class OpenAILlm extends BaseLlm {
     }
 
     /**
-     * Sets the maximum number of tokens to generate. If {@link #apiClient(Client)}
-     * is also set,
-     * the explicit client will take precedence. If
-     * {@link #vertexCredentials(VertexCredentials)} is also set,
-     * this apiKey will take precedence.
+     * Sets the maximum number of tokens to generate. If {@link #apiClient(Client)} is also set, the
+     * explicit client will take precedence. If {@link #vertexCredentials(VertexCredentials)} is
+     * also set, this apiKey will take precedence.
      *
      * @param maxTokens The maximum number of tokens to generate.
      * @return This builder.
@@ -408,11 +409,9 @@ public class OpenAILlm extends BaseLlm {
       if (apiClient != null) {
         return new OpenAILlm(modelName, apiClient);
       } else {
-        return new OpenAILlm(
-            modelName, OpenAIOkHttpClient.fromEnv());
+        return new OpenAILlm(modelName, OpenAIOkHttpClient.fromEnv());
       }
     }
-
   }
 
   @Override
