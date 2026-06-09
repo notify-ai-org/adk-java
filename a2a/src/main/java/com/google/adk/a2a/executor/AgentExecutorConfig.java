@@ -30,19 +30,17 @@ public abstract class AgentExecutorConfig {
   /**
    * Output mode for the agent executor.
    *
-   * <p>
-   * ARTIFACT_PER_RUN: The agent executor will return one artifact per run.
+   * <p>ARTIFACT_PER_RUN: The agent executor will return one artifact per run.
    *
-   * <p>
-   * ARTIFACT_PER_EVENT: The agent executor will return one artifact per event.
+   * <p>ARTIFACT_PER_EVENT: The agent executor will return one artifact per event.
    */
   public enum OutputMode {
     ARTIFACT_PER_RUN,
     ARTIFACT_PER_EVENT
   }
 
-  private static final RunConfig DEFAULT_RUN_CONFIG = RunConfig.builder().setStreamingMode(RunConfig.StreamingMode.NONE)
-      .setMaxLlmCalls(20).build();
+  private static final RunConfig DEFAULT_RUN_CONFIG =
+      RunConfig.builder().setStreamingMode(RunConfig.StreamingMode.NONE).setMaxLlmCalls(20).build();
 
   public abstract RunConfig runConfig();
 
