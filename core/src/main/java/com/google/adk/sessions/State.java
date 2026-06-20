@@ -16,7 +16,6 @@
 
 package com.google.adk.sessions;
 
-import com.fasterxml.jackson.annotation.JsonValue;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -187,18 +186,5 @@ public final class State implements ConcurrentMap<String, Object> {
 
   public boolean hasDelta() {
     return !delta.isEmpty();
-  }
-
-  private static final class RemovedSentinel {
-    public static final RemovedSentinel INSTANCE = new RemovedSentinel();
-
-    private RemovedSentinel() {
-      // Enforce singleton.
-    }
-
-    @JsonValue
-    public String toJson() {
-      return "__ADK_SENTINEL_REMOVED__";
-    }
   }
 }
