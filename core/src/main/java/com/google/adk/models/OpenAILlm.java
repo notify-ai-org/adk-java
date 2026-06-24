@@ -128,7 +128,7 @@ public class OpenAILlm extends BaseLlm {
         ChatCompletionCreateParams.builder()
             .model(llmRequest.model().orElse(model()))
             .messages(messages)
-            .maxTokens((long) this.maxTokens);
+            .maxCompletionTokens((long) this.maxTokens);
 
     if (!tools.isEmpty()) {
       paramsBuilder.tools(tools);

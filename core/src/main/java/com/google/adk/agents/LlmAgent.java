@@ -623,9 +623,7 @@ public class LlmAgent extends BaseAgent {
       Optional<Schema> outputSchema = outputSchema();
       if (outputSchema.isPresent()) {
         try {
-          Map<String, Object> validatedMap =
-              SchemaUtils.validateOutputSchema(rawResult, outputSchema.get());
-          output = validatedMap;
+          output = SchemaUtils.validateOutputSchemaValue(rawResult, outputSchema.get());
         } catch (JsonProcessingException e) {
           logger.error(
               "LlmAgent output for outputKey '{}' was not valid JSON, despite an outputSchema being"

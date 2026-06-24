@@ -20,7 +20,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.google.common.base.Preconditions;
 import com.google.genai.types.Schema;
 import com.google.genai.types.Type;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -138,8 +137,25 @@ public final class SchemaUtils {
   @SuppressWarnings("unchecked") // For tool parameter type casting.
   public static Map<String, Object> validateOutputSchema(String output, Schema schema)
       throws JsonProcessingException {
-    Map<String, Object> outputMap = JsonBaseModel.getMapper().readValue(output, HashMap.class);
-    validateMapOnSchema(outputMap, schema, false);
-    return outputMap;
+    Object outputValue = validateOutputSchemaValue(output, schema);
+    if (!(outputValue instanceof Map)) {
+      throw new IllegalArgumentException("Output does not match the map-shaped schema: " + schema);
+    }
+    return (Map<String, Object>) outputValue;
+  }
+
+  /**
+   * Validates any JSON value against an output schema.
+   *
+   * <p>Agent output schemas may be arrays or scalars as well as objects. Tool outputs remain
+   * map-shaped and should use {@link #validateOutputSchema}.
+   */
+  public static Object validateOutputSchemaValue(String output, Schema schema)
+      throws JsonProcessingException {
+    Object outputValue = JsonBaseModel.getMapper().readValue(output, Object.class);
+    if (!matchType(outputValue, schema, false)) {
+      throw new IllegalArgumentException("Output does not match agent output schema: " + schema);
+    }
+    return outputValue;
   }
 }
