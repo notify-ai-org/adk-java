@@ -88,6 +88,9 @@ public final class SchemaUtils {
    */
   public static void validateMapOnSchema(Map<String, Object> args, Schema schema, Boolean isInput) {
     Preconditions.checkNotNull(isInput, "IsInput cannot be null");
+    if (!schema.properties().isPresent() || schema.properties().get().isEmpty()) {
+      return;
+    }
     Map<String, Schema> properties = schema.properties().get();
     for (Entry<String, Object> arg : args.entrySet()) {
       // Check if the argument is in the schema.

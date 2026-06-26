@@ -70,26 +70,50 @@ public final class Contents implements RequestProcessor {
     }
 
     if (llmAgent.includeContents() == LlmAgent.IncludeContents.NONE) {
+      ImmutableList<Content> currentTurnContents =
+          includeCurrentUserContent(
+              getCurrentTurnContents(
+                  context.branch().orElse(null), sessionEvents, context.agent().name(), modelName),
+              context.userContent());
       return Single.just(
           RequestProcessor.RequestProcessingResult.create(
-              request.toBuilder()
-                  .contents(
-                      getCurrentTurnContents(
-                          context.branch().orElse(null),
-                          sessionEvents,
-                          context.agent().name(),
-                          modelName))
-                  .build(),
-              ImmutableList.of()));
+              request.toBuilder().contents(currentTurnContents).build(), ImmutableList.of()));
     }
 
     ImmutableList<Content> contents =
-        getContents(
-            context.branch().orElse(null), sessionEvents, context.agent().name(), modelName);
+        includeCurrentUserContent(
+            getContents(
+                context.branch().orElse(null), sessionEvents, context.agent().name(), modelName),
+            context.userContent());
 
     return Single.just(
         RequestProcessor.RequestProcessingResult.create(
             request.toBuilder().contents(contents).build(), ImmutableList.of()));
+  }
+
+  private ImmutableList<Content> includeCurrentUserContent(
+      ImmutableList<Content> contents, Optional<Content> userContent) {
+    if (userContent.isEmpty() || isEmptyContent(userContent.get())) {
+      return contents;
+    }
+    Content currentUserContent = ensureRole(userContent.get(), "user");
+    if (contents.stream().anyMatch(content -> content.equals(currentUserContent))) {
+      return contents;
+    }
+    return ImmutableList.<Content>builder().addAll(contents).add(currentUserContent).build();
+  }
+
+  private Content ensureRole(Content content, String role) {
+    if (content.role().isPresent() && !content.role().get().isBlank()) {
+      return content;
+    }
+    return content.toBuilder().role(role).build();
+  }
+
+  private boolean isEmptyContent(Content content) {
+    return (content.parts().isEmpty()
+        || content.parts().get().isEmpty()
+        || content.parts().get().stream().allMatch(this::isPartInvisible));
   }
 
   /** Gets contents for the current turn only (no conversation history). */
