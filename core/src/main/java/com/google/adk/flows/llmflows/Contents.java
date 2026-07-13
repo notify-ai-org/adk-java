@@ -96,6 +96,9 @@ public final class Contents implements RequestProcessor {
     if (userContent.isEmpty() || isEmptyContent(userContent.get())) {
       return contents;
     }
+    if (isRequestConfirmationContent(userContent.get())) {
+      return contents;
+    }
     Content currentUserContent = ensureRole(userContent.get(), "user");
     if (contents.stream().anyMatch(content -> content.equals(currentUserContent))) {
       return contents;
@@ -801,9 +804,13 @@ public final class Contents implements RequestProcessor {
 
   /** Checks if the event is a request confirmation event. */
   private static boolean isRequestConfirmationEvent(Event event) {
-    return event.content().flatMap(Content::parts).stream()
+    return event.content().map(Contents::isRequestConfirmationContent).orElse(false);
+  }
+
+  /** Checks if the content is a request confirmation function call or response. */
+  private static boolean isRequestConfirmationContent(Content content) {
+    return content.parts().stream()
         .flatMap(List::stream)
-        // return event.content().flatMap(Content::parts).orElse(ImmutableList.of()).stream()
         .anyMatch(
             part ->
                 part.functionCall()
