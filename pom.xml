@@ -25,7 +25,6 @@
   <description>Google Agent Development Kit (ADK) for Java</description>
 
   <modules>
-    <module>../ollama4j</module>
     <module>core</module>
     <module>a2a</module>
   </modules>

@@ -41,7 +41,7 @@ public final class LlmRegistry {
     registerLlm("apigee/.*", modelName -> ApigeeLlm.builder().modelName(modelName).build());
     registerLlm("gemma-.*", modelName -> Gemini.builder().modelName(modelName).build());
     registerLlm("gpt-.*", modelName -> OpenAILlm.builder().modelName(modelName).build());
-    registerLlm("ollama/.*", modelName -> OllamaLlm.builder().modelName(modelName).build());
+    registerLlm("groq/.*", modelName -> GroqLlm.builder().modelName(modelName).build());
   }
 
   /**
