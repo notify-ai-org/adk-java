@@ -26,7 +26,7 @@ import com.google.adk.events.Event;
 import com.google.adk.plugins.Plugin;
 import com.google.adk.telemetry.Instrumentation;
 import com.google.adk.telemetry.Instrumentation.AgentInvocation;
-import com.google.adk.utils.AgentEnums.AgentOrigin;
+import com.google.adk.utils.AgentOrigin;
 import com.google.common.collect.ImmutableList;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.errorprone.annotations.DoNotCall;

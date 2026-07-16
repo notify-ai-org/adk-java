@@ -39,7 +39,7 @@ import com.google.adk.tools.BaseTool;
 import com.google.adk.tools.FunctionTool;
 import com.google.adk.tools.ToolContext;
 import com.google.adk.tools.mcp.AbstractMcpTool;
-import com.google.adk.utils.AgentEnums.AgentOrigin;
+import com.google.adk.utils.AgentOrigin;
 import com.google.api.gax.rpc.FixedHeaderProvider;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.cloud.bigquery.BigQuery;
