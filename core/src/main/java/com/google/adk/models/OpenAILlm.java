@@ -31,10 +31,12 @@ import com.openai.models.chat.completions.ChatCompletionUserMessageParam;
 import io.reactivex.rxjava3.core.Flowable;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -103,12 +105,37 @@ public class OpenAILlm extends BaseLlm {
               ChatCompletionSystemMessageParam.builder().content(systemText).build()));
     }
 
-    // Convert each ADK Content to an OpenAI ChatCompletionMessageParam.
-    for (Content content : llmRequest.contents()) {
-      ChatCompletionMessageParam messageParam = contentToOpenAIMessageParam(content);
-      if (messageParam != null) {
-        messages.add(messageParam);
+    // Convert each ADK Content to OpenAI ChatCompletionMessageParam entries.
+    // A single ADK content may contain multiple function responses; OpenAI requires
+    // one tool message per tool_call_id.
+    Set<String> expectedToolResponseIds = new HashSet<>();
+    List<Content> contents = llmRequest.contents();
+    for (int i = 0; i < contents.size(); i++) {
+      Content content = contents.get(i);
+      if (hasFunctionCall(content)) {
+        Set<String> callIds = functionCallIds(content);
+        if (!hasImmediateFunctionResponsesForAll(contents, i, callIds)) {
+          logger.warn("Skipping orphan OpenAI tool-call history entry with ids={}", callIds);
+          continue;
+        }
+        messages.addAll(contentToOpenAIMessageParams(content));
+        expectedToolResponseIds.addAll(callIds);
+        continue;
       }
+
+      if (hasFunctionResponse(content)) {
+        if (expectedToolResponseIds.isEmpty()) {
+          logger.warn(
+              "Skipping orphan OpenAI tool-response history entry with ids={}",
+              functionResponseIds(content));
+          continue;
+        }
+        messages.addAll(functionResponseMessages(content, expectedToolResponseIds));
+        expectedToolResponseIds.removeAll(functionResponseIds(content));
+        continue;
+      }
+
+      messages.addAll(contentToOpenAIMessageParams(content));
     }
 
     // Convert ADK function declarations to OpenAI tools.
@@ -144,15 +171,15 @@ public class OpenAILlm extends BaseLlm {
   }
 
   private ChatCompletionMessageParam contentToOpenAIMessageParam(Content content) {
+    List<ChatCompletionMessageParam> messages = contentToOpenAIMessageParams(content);
+    return messages.isEmpty() ? null : messages.get(0);
+  }
+
+  private List<ChatCompletionMessageParam> contentToOpenAIMessageParams(Content content) {
     String role = content.role().orElse("");
     List<Part> parts = content.parts().orElse(ImmutableList.of());
 
-    // Check if this content has function calls (assistant message with tool_use).
-    boolean hasFunctionCall = parts.stream().anyMatch(p -> p.functionCall().isPresent());
-    // Check if this content has function responses (tool results).
-    boolean hasFunctionResponse = parts.stream().anyMatch(p -> p.functionResponse().isPresent());
-
-    if (hasFunctionCall) {
+    if (hasFunctionCall(content)) {
       // Build an assistant message with tool calls.
       String textContent =
           parts.stream()
@@ -186,31 +213,9 @@ public class OpenAILlm extends BaseLlm {
         assistantBuilder.content(textContent);
       }
 
-      return ChatCompletionMessageParam.ofAssistant(assistantBuilder.build());
-    } else if (hasFunctionResponse) {
-      // Each function response becomes a separate tool message.
-      // Return the first one; if there are multiple, they should be separate
-      // messages.
-      // For simplicity, return the first function response as a tool message.
-      for (Part p : parts) {
-        if (p.functionResponse().isPresent()) {
-          String responseContent = "";
-          if (p.functionResponse().get().response().isPresent()) {
-            Map<String, Object> responseData = p.functionResponse().get().response().get();
-            Object resultObj = responseData.get("result");
-            if (resultObj != null) {
-              responseContent = resultObj.toString();
-            } else {
-              responseContent = serializeToJson(responseData);
-            }
-          }
-          return ChatCompletionMessageParam.ofTool(
-              ChatCompletionToolMessageParam.builder()
-                  .toolCallId(p.functionResponse().get().id().orElse(""))
-                  .content(responseContent)
-                  .build());
-        }
-      }
+      return List.of(ChatCompletionMessageParam.ofAssistant(assistantBuilder.build()));
+    } else if (hasFunctionResponse(content)) {
+      return functionResponseMessages(content, null);
     }
 
     // Regular text message: determine role.
@@ -221,12 +226,91 @@ public class OpenAILlm extends BaseLlm {
             .collect(Collectors.joining("\n"));
 
     if (role.equals("model") || role.equals("assistant")) {
-      return ChatCompletionMessageParam.ofAssistant(
-          ChatCompletionAssistantMessageParam.builder().content(textContent).build());
+      return List.of(
+          ChatCompletionMessageParam.ofAssistant(
+              ChatCompletionAssistantMessageParam.builder().content(textContent).build()));
     } else {
-      return ChatCompletionMessageParam.ofUser(
-          ChatCompletionUserMessageParam.builder().content(textContent).build());
+      return List.of(
+          ChatCompletionMessageParam.ofUser(
+              ChatCompletionUserMessageParam.builder().content(textContent).build()));
     }
+  }
+
+  private boolean hasFunctionCall(Content content) {
+    return content.parts().orElse(ImmutableList.of()).stream()
+        .anyMatch(p -> p.functionCall().isPresent());
+  }
+
+  private boolean hasFunctionResponse(Content content) {
+    return content.parts().orElse(ImmutableList.of()).stream()
+        .anyMatch(p -> p.functionResponse().isPresent());
+  }
+
+  private Set<String> functionCallIds(Content content) {
+    return content.parts().orElse(ImmutableList.of()).stream()
+        .flatMap(part -> part.functionCall().stream())
+        .flatMap(call -> call.id().stream())
+        .filter(id -> !id.isBlank())
+        .collect(Collectors.toSet());
+  }
+
+  private Set<String> functionResponseIds(Content content) {
+    return content.parts().orElse(ImmutableList.of()).stream()
+        .flatMap(part -> part.functionResponse().stream())
+        .flatMap(response -> response.id().stream())
+        .filter(id -> !id.isBlank())
+        .collect(Collectors.toSet());
+  }
+
+  private boolean hasImmediateFunctionResponsesForAll(
+      List<Content> contents, int functionCallIndex, Set<String> requiredIds) {
+    if (requiredIds.isEmpty()) {
+      return false;
+    }
+
+    Set<String> remaining = new HashSet<>(requiredIds);
+    for (int i = functionCallIndex + 1; i < contents.size(); i++) {
+      Content next = contents.get(i);
+      if (!hasFunctionResponse(next)) {
+        break;
+      }
+      remaining.removeAll(functionResponseIds(next));
+      if (remaining.isEmpty()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private List<ChatCompletionMessageParam> functionResponseMessages(
+      Content content, @Nullable Set<String> allowedResponseIds) {
+    List<ChatCompletionMessageParam> toolMessages = new ArrayList<>();
+    for (Part p : content.parts().orElse(ImmutableList.of())) {
+      if (p.functionResponse().isEmpty()) {
+        continue;
+      }
+      String responseId = p.functionResponse().get().id().orElse("");
+      if (allowedResponseIds != null && !allowedResponseIds.contains(responseId)) {
+        continue;
+      }
+      String responseContent = "";
+      if (p.functionResponse().get().response().isPresent()) {
+        Map<String, Object> responseData = p.functionResponse().get().response().get();
+        Object resultObj = responseData.get("result");
+        if (resultObj != null) {
+          responseContent = resultObj.toString();
+        } else {
+          responseContent = serializeToJson(responseData);
+        }
+      }
+      toolMessages.add(
+          ChatCompletionMessageParam.ofTool(
+              ChatCompletionToolMessageParam.builder()
+                  .toolCallId(responseId)
+                  .content(responseContent)
+                  .build()));
+    }
+    return toolMessages;
   }
 
   private String serializeToJson(Object obj) {
