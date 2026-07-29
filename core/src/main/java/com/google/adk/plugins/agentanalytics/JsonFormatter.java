@@ -24,7 +24,9 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.auto.value.AutoValue;
 import com.google.common.base.Utf8;
+import com.google.common.collect.ImmutableSet;
 import java.util.IdentityHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.logging.Logger;
@@ -36,6 +38,24 @@ final class JsonFormatter {
   static final ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
   static final String TRUNCATION_SUFFIX = "...[truncated]";
   static final String CYCLE_DETECTED_MESSAGE = "[cycle detected]";
+  static final String MAX_DEPTH_MESSAGE = "[max depth exceeded]";
+  static final String REDACTED_MESSAGE = "[REDACTED]";
+  static final String UNSERIALIZABLE_MESSAGE = "[UNSERIALIZABLE]";
+  // Guard against unbounded recursion on deeply nested (non-cyclic) payloads.
+  static final int MAX_TRUNCATE_DEPTH = 200;
+
+  // Keys whose values are redacted before logging. Mirrors the Python BQAA plugin's
+  // _SENSITIVE_KEYS (OAuth tokens / secrets); matching is case-insensitive, plus any
+  // key prefixed with "temp:" (ADK temporary session state).
+  private static final ImmutableSet<String> SENSITIVE_KEYS =
+      ImmutableSet.of(
+          "client_secret", "access_token", "refresh_token", "id_token", "api_key", "password");
+  private static final String TEMP_KEY_PREFIX = "temp:";
+
+  private static boolean isSensitiveKey(String key) {
+    String lower = key.toLowerCase(Locale.ROOT);
+    return SENSITIVE_KEYS.contains(lower) || lower.startsWith(TEMP_KEY_PREFIX);
+  }
 
   @AutoValue
   abstract static class TruncationResult {
@@ -55,13 +75,92 @@ final class JsonFormatter {
     }
     try {
       if (obj instanceof JsonNode jsonNode) {
-        return recursiveSmartTruncate(jsonNode, maxLength, newSetFromMap(new IdentityHashMap<>()));
+        return recursiveSmartTruncate(
+            jsonNode, maxLength, newSetFromMap(new IdentityHashMap<>()), 0);
       }
       return recursiveSmartTruncate(
-          mapper.valueToTree(obj), maxLength, newSetFromMap(new IdentityHashMap<>()));
+          mapper.valueToTree(obj), maxLength, newSetFromMap(new IdentityHashMap<>()), 0);
     } catch (IllegalArgumentException e) {
-      // Fallback for types that mapper can't handle directly as a tree
+      // Fallback for types that mapper can't handle directly as a tree.
+      logger.fine("smartTruncate falling back to string conversion: " + e.getMessage());
       return truncateWithStatus(safeToString(obj), maxLength);
+    }
+  }
+
+  /**
+   * Redacts sensitive keys across an attributes tree, failing closed on unserializable values.
+   *
+   * <p>Unlike {@link #smartTruncate}, which converts the whole object to JSON first (so one
+   * unsupported value routes the ENTIRE tree through the textual {@code safeToString} fallback,
+   * exposing sibling secrets as plain text), this walks raw Java containers natively: keys are
+   * redacted before any Jackson conversion, and only leaf values are converted individually. A leaf
+   * that cannot be converted becomes {@value #UNSERIALIZABLE_MESSAGE} without affecting its
+   * siblings. No length truncation is applied.
+   */
+  static JsonNode redactTree(Object obj) {
+    return redactTreeInternal(obj, newSetFromMap(new IdentityHashMap<>()), 0);
+  }
+
+  private static JsonNode redactTreeInternal(Object obj, Set<Object> visited, int depth) {
+    if (obj == null) {
+      return mapper.nullNode();
+    }
+    if (depth > MAX_TRUNCATE_DEPTH) {
+      return mapper.valueToTree(MAX_DEPTH_MESSAGE);
+    }
+    // JsonNode must be handled before the Iterable branch: ObjectNode implements
+    // Iterable<JsonNode> over its VALUES, so the generic Iterable walk would flatten a JSON
+    // object into an array and lose its keys.
+    if (obj instanceof JsonNode jsonNode) {
+      return recursiveSmartTruncate(
+              jsonNode, Integer.MAX_VALUE, newSetFromMap(new IdentityHashMap<>()), depth)
+          .node();
+    }
+    if (obj instanceof Map<?, ?> map) {
+      if (!visited.add(obj)) {
+        return mapper.valueToTree(CYCLE_DETECTED_MESSAGE);
+      }
+      try {
+        ObjectNode node = mapper.createObjectNode();
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+          String key = String.valueOf(entry.getKey());
+          if (isSensitiveKey(key)) {
+            node.set(key, mapper.valueToTree(REDACTED_MESSAGE));
+            continue;
+          }
+          node.set(key, redactTreeInternal(entry.getValue(), visited, depth + 1));
+        }
+        return node;
+      } finally {
+        visited.remove(obj);
+      }
+    }
+    if (obj instanceof Iterable<?> iterable) {
+      if (!visited.add(obj)) {
+        return mapper.valueToTree(CYCLE_DETECTED_MESSAGE);
+      }
+      try {
+        ArrayNode node = mapper.createArrayNode();
+        for (Object element : iterable) {
+          node.add(redactTreeInternal(element, visited, depth + 1));
+        }
+        return node;
+      } finally {
+        visited.remove(obj);
+      }
+    }
+    try {
+      // A converted leaf may itself be a container (e.g. a POJO serialized to an object): run the
+      // JSON-level redacting walk over it with truncation disabled.
+      return recursiveSmartTruncate(
+              mapper.valueToTree(obj),
+              Integer.MAX_VALUE,
+              newSetFromMap(new IdentityHashMap<>()),
+              depth)
+          .node();
+    } catch (IllegalArgumentException e) {
+      logger.fine("redactTree replacing unserializable value: " + e.getMessage());
+      return mapper.valueToTree(UNSERIALIZABLE_MESSAGE);
     }
   }
 
@@ -87,7 +186,10 @@ final class JsonFormatter {
   }
 
   private static TruncationResult recursiveSmartTruncate(
-      JsonNode node, int maxLength, Set<JsonNode> visited) {
+      JsonNode node, int maxLength, Set<JsonNode> visited, int depth) {
+    if (depth > MAX_TRUNCATE_DEPTH) {
+      return TruncationResult.create(mapper.valueToTree(MAX_DEPTH_MESSAGE), true);
+    }
     if (node.isContainerNode()) {
       if (visited.contains(node)) {
         return TruncationResult.create(mapper.valueToTree(CYCLE_DETECTED_MESSAGE), true);
@@ -106,7 +208,14 @@ final class JsonFormatter {
         ObjectNode newNode = mapper.createObjectNode();
         Set<Map.Entry<String, JsonNode>> properties = node.properties();
         for (Map.Entry<String, JsonNode> entry : properties) {
-          TruncationResult res = recursiveSmartTruncate(entry.getValue(), maxLength, visited);
+          // Redact sensitive values without descending into them. Per parity with the
+          // Python plugin, redaction does not set the is_truncated flag.
+          if (isSensitiveKey(entry.getKey())) {
+            newNode.set(entry.getKey(), mapper.valueToTree(REDACTED_MESSAGE));
+            continue;
+          }
+          TruncationResult res =
+              recursiveSmartTruncate(entry.getValue(), maxLength, visited, depth + 1);
           newNode.set(entry.getKey(), res.node());
           isTruncated = isTruncated || res.isTruncated();
         }
@@ -114,7 +223,7 @@ final class JsonFormatter {
       } else if (node.isArray()) {
         ArrayNode newNode = mapper.createArrayNode();
         for (JsonNode element : node) {
-          TruncationResult res = recursiveSmartTruncate(element, maxLength, visited);
+          TruncationResult res = recursiveSmartTruncate(element, maxLength, visited, depth + 1);
           newNode.add(res.node());
           isTruncated = isTruncated || res.isTruncated();
         }

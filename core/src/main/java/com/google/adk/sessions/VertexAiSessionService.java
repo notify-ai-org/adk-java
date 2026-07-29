@@ -148,7 +148,7 @@ public final class VertexAiSessionService implements BaseSessionService {
       Session session =
           Session.builder(sessionId)
               .appName(appName)
-              .userId(userId)
+              .userId((String) apiSession.get("userId"))
               .state(
                   apiSession.get("sessionState") == null
                       ? new ConcurrentHashMap<>()
@@ -164,9 +164,15 @@ public final class VertexAiSessionService implements BaseSessionService {
 
   @Override
   public Single<ListEventsResponse> listEvents(String appName, String userId, String sessionId) {
+    validateSessionId(sessionId);
+    return listEventsInternal(appName, sessionId, /* filter= */ null);
+  }
+
+  private Single<ListEventsResponse> listEventsInternal(
+      String appName, String sessionId, @Nullable String filter) {
     String reasoningEngineId = parseReasoningEngineId(appName);
     return client
-        .listEvents(reasoningEngineId, sessionId)
+        .listEvents(reasoningEngineId, sessionId, filter)
         .map(this::parseListEventsResponse)
         .defaultIfEmpty(ListEventsResponse.builder().build());
   }
@@ -190,11 +196,21 @@ public final class VertexAiSessionService implements BaseSessionService {
   @Override
   public Maybe<Session> getSession(
       String appName, String userId, String sessionId, Optional<GetSessionConfig> config) {
+    validateSessionId(sessionId);
     String reasoningEngineId = parseReasoningEngineId(appName);
     return client
         .getSession(reasoningEngineId, sessionId)
         .flatMap(
             getSessionResponseMap -> {
+              // Enforce ownership using the owner reported by the backend, not the
+              // requested user id. Deny as not-found so existence is not revealed.
+              String ownerUserId =
+                  Optional.ofNullable(getSessionResponseMap.get("userId"))
+                      .map(JsonNode::asText)
+                      .orElse(null);
+              if (!userId.equals(ownerUserId)) {
+                return Maybe.<Session>empty();
+              }
               String sessId =
                   Optional.ofNullable(getSessionResponseMap.get("name"))
                       .map(name -> Iterables.getLast(Splitter.on('/').splitToList(name.asText())))
@@ -212,7 +228,7 @@ public final class VertexAiSessionService implements BaseSessionService {
                         new TypeReference<ConcurrentMap<String, Object>>() {}));
               }
 
-              return listEvents(appName, userId, sessionId)
+              return listEventsInternal(appName, sessionId, afterTimestampFilter(config))
                   .map(
                       response -> {
                         Session.Builder sessionBuilder =
@@ -225,44 +241,40 @@ public final class VertexAiSessionService implements BaseSessionService {
                         if (events.isEmpty()) {
                           return sessionBuilder.build();
                         }
-                        events = filterEvents(events, updateTimestamp, config);
+                        events = filterEvents(events, config);
                         return sessionBuilder.events(events).build();
                       })
                   .toMaybe();
             });
   }
 
+  /**
+   * Inclusive server-side {@code timestamp>=} filter for {@code afterTimestamp}, or null. Applied
+   * independently of {@code numRecentEvents} (see {@link #filterEvents}), so both filters compose.
+   */
+  private static @Nullable String afterTimestampFilter(Optional<GetSessionConfig> config) {
+    if (config.isPresent() && config.get().afterTimestamp().isPresent()) {
+      return "timestamp>=\"" + config.get().afterTimestamp().get() + "\"";
+    }
+    return null;
+  }
+
   private static List<Event> filterEvents(
-      List<Event> originalEvents,
-      @Nullable Instant updateTimestamp,
-      Optional<GetSessionConfig> config) {
+      List<Event> originalEvents, Optional<GetSessionConfig> config) {
+    // Preserve the full event stream that Vertex AI returns. Event timestamps are
+    // assigned client-side while updateTime is assigned server-side, so filtering
+    // on updateTime could silently drop the most recently appended event(s).
+    // afterTimestamp is filtered server-side (see afterTimestampFilter), so only
+    // numRecentEvents is applied here.
     List<Event> events =
         originalEvents.stream()
-            .filter(
-                event ->
-                    updateTimestamp == null
-                        || Instant.ofEpochMilli(event.timestamp()).isBefore(updateTimestamp))
-            .sorted(Comparator.comparing(Event::timestamp))
+            .sorted(Comparator.comparingLong(Event::timestamp))
             .collect(toCollection(ArrayList::new));
 
-    if (config.isPresent()) {
-      if (config.get().numRecentEvents().isPresent()) {
-        int numRecentEvents = config.get().numRecentEvents().get();
-        if (events.size() > numRecentEvents) {
-          events = events.subList(events.size() - numRecentEvents, events.size());
-        }
-      } else if (config.get().afterTimestamp().isPresent()) {
-        Instant afterTimestamp = config.get().afterTimestamp().get();
-        int i = events.size() - 1;
-        while (i >= 0) {
-          if (Instant.ofEpochMilli(events.get(i).timestamp()).isBefore(afterTimestamp)) {
-            break;
-          }
-          i -= 1;
-        }
-        if (i >= 0) {
-          events = events.subList(i, events.size());
-        }
+    if (config.isPresent() && config.get().numRecentEvents().isPresent()) {
+      int numRecentEvents = config.get().numRecentEvents().get();
+      if (events.size() > numRecentEvents) {
+        events = events.subList(events.size() - numRecentEvents, events.size());
       }
     }
     return events;
@@ -270,12 +282,31 @@ public final class VertexAiSessionService implements BaseSessionService {
 
   @Override
   public Completable deleteSession(String appName, String userId, String sessionId) {
+    validateSessionId(sessionId);
     String reasoningEngineId = parseReasoningEngineId(appName);
-    return client.deleteSession(reasoningEngineId, sessionId);
+    // Fetch first and enforce ownership: the backend delete ignores user id, so
+    // without this check any user could delete another user's session. A missing
+    // session completes as a no-op.
+    return client
+        .getSession(reasoningEngineId, sessionId)
+        .flatMapCompletable(
+            getSessionResponseMap -> {
+              String ownerUserId =
+                  Optional.ofNullable(getSessionResponseMap.get("userId"))
+                      .map(JsonNode::asText)
+                      .orElse(null);
+              if (!userId.equals(ownerUserId)) {
+                return Completable.error(
+                    new SecurityException(
+                        "Session " + sessionId + " does not belong to user " + userId + "."));
+              }
+              return client.deleteSession(reasoningEngineId, sessionId);
+            });
   }
 
   @Override
   public Single<Event> appendEvent(Session session, Event event) {
+    validateSessionId(session.id());
     String reasoningEngineId = parseReasoningEngineId(session.appName());
     return BaseSessionService.super
         .appendEvent(session, event)
@@ -315,4 +346,22 @@ public final class VertexAiSessionService implements BaseSessionService {
   private static final Pattern APP_NAME_PATTERN =
       Pattern.compile(
           "^projects/([a-zA-Z0-9-_]+)/locations/([a-zA-Z0-9-_]+)/reasoningEngines/(\\d+)$");
+
+  /** Rejects session ids that could escape the URL path segment. */
+  static void validateSessionId(String sessionId) {
+    if (sessionId == null || !SESSION_ID_PATTERN.matcher(sessionId).matches()) {
+      throw new IllegalArgumentException(
+          "Invalid session id: "
+              + sessionId
+              + ". It must match "
+              + SESSION_ID_PATTERN.pattern()
+              + ".");
+    }
+  }
+
+  /**
+   * Allowed session id characters. Matches the adk-python {@code _validate_session_id} allowlist
+   * and keeps the id within a single URL path segment (no '/', '?', '#', or '..').
+   */
+  private static final Pattern SESSION_ID_PATTERN = Pattern.compile("^[a-zA-Z0-9_-]+$");
 }

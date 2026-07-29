@@ -1,9 +1,27 @@
+/*
+ * Copyright 2025 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.google.adk.tools;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.*;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.adk.JsonBaseModel;
 import com.google.adk.agents.InvocationContext;
 import com.google.adk.agents.LlmAgent;
 import com.google.adk.models.Gemini;
@@ -162,6 +180,33 @@ public final class BaseToolTest {
         .containsExactly(
             Tool.builder().functionDeclarations(ImmutableList.of(functionDeclaration)).build(),
             Tool.builder().googleSearch(GoogleSearch.builder().build()).build());
+  }
+
+  @Test
+  public void processLlmRequestWithLatestAliasAddsToolToConfig() {
+    final GoogleSearchTool googleSearchTool = new GoogleSearchTool();
+    LlmRequest.Builder builder =
+        LlmRequest.builder().model("gemini-flash-latest").build().toBuilder();
+    Completable result = googleSearchTool.processLlmRequest(builder, null);
+    result.test().assertComplete();
+    assertThat(builder.build().config().get().tools().get())
+        .contains(Tool.builder().googleSearch(GoogleSearch.builder().build()).build());
+  }
+
+  @Test
+  public void processLlmRequestWithUnsupportedModelReturnsError() {
+    final GoogleSearchTool googleSearchTool = new GoogleSearchTool();
+    LlmRequest.Builder builder = LlmRequest.builder().model("text-bison-001").build().toBuilder();
+    Completable result = googleSearchTool.processLlmRequest(builder, null);
+    result.test().assertError(IllegalArgumentException.class);
+  }
+
+  @Test
+  public void processLlmRequest_WithNullModel_ReturnsError() {
+    final GoogleSearchTool googleSearchTool = new GoogleSearchTool();
+    LlmRequest.Builder builder = LlmRequest.builder().build().toBuilder();
+    Completable result = googleSearchTool.processLlmRequest(builder, null);
+    result.test().assertError(IllegalArgumentException.class);
   }
 
   @Test
@@ -354,5 +399,57 @@ public final class BaseToolTest {
     testObserver.assertValue(expected);
   }
 
+  @Test
+  public void testProcessLlmRequest_WithNoModel_DoesNotThrowsException() {
+    GoogleSearchTool tool = GoogleSearchTool.INSTANCE;
+    LlmRequest.Builder requestBuilder = LlmRequest.builder();
+
+    tool.processLlmRequest(requestBuilder, null);
+
+    assertNotNull(requestBuilder);
+  }
+
   public record TestToolArgs(int i, String s) {}
+
+  @Test
+  public void testToolConfigJsonSerialization() {
+    BaseTool.ToolArgsConfig args = new BaseTool.ToolArgsConfig();
+    args.put("arg1", "value1");
+    args.put("arg2", 2);
+
+    BaseTool.ToolConfig config = new BaseTool.ToolConfig("testTool", args);
+
+    String json = config.toJson();
+    assertNotNull(json);
+    assertFalse(json.isEmpty());
+
+    assertTrue(json.contains("\"name\":\"testTool\""));
+    assertTrue(json.contains("\"arg1\":\"value1\""));
+    assertTrue(json.contains("\"arg2\":2"));
+  }
+
+  @Test
+  public void testToolConfigJsonDeserialization() throws Exception {
+    String jsonInput =
+        """
+        {
+          "name": "deserializing",
+          "args": {
+            "timeoutMs": 5000,
+            "retryCount": 3
+          }
+        }
+        """;
+
+    BaseTool.ToolConfig config =
+        JsonBaseModel.getMapper().readValue(jsonInput, BaseTool.ToolConfig.class);
+
+    assertNotNull(config);
+    assertEquals("deserializing", config.name());
+
+    assertNotNull(config.args());
+    assertEquals(2, config.args().size());
+    assertEquals(5000, config.args().getAdditionalProperties().get("timeoutMs"));
+    assertEquals(3, config.args().getAdditionalProperties().get("retryCount"));
+  }
 }

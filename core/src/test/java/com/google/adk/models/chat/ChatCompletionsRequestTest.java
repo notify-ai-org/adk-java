@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      https://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -34,10 +34,13 @@ import com.google.genai.types.FunctionDeclaration;
 import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.GenerateContentConfig;
 import com.google.genai.types.Part;
+import com.google.genai.types.Schema;
 import com.google.genai.types.Tool;
 import com.google.genai.types.ToolConfig;
 import java.util.AbstractMap;
+import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.junit.Before;
 import org.junit.Test;
@@ -566,6 +569,84 @@ public final class ChatCompletionsRequestTest {
   }
 
   @Test
+  public void testFromLlmRequest_withAbsentFunctionArguments() throws Exception {
+    FunctionCall functionCall = FunctionCall.builder().id("call_123").name("get_time").build();
+    Part part = Part.builder().functionCall(functionCall).build();
+    Content content = Content.builder().role("model").parts(ImmutableList.of(part)).build();
+
+    LlmRequest llmRequest =
+        LlmRequest.builder().model("gemini-1.5-pro").contents(ImmutableList.of(content)).build();
+
+    ChatCompletionsRequest request = ChatCompletionsRequest.fromLlmRequest(llmRequest, false);
+
+    assertThat(request.messages).hasSize(1);
+    ChatCompletionsRequest.Message msg = request.messages.get(0);
+    assertThat(msg.role).isEqualTo("assistant");
+    assertThat(msg.toolCalls).hasSize(1);
+    assertThat(msg.toolCalls.get(0).function.name).isEqualTo("get_time");
+    assertThat(msg.toolCalls.get(0).function.arguments).isEqualTo("{}");
+  }
+
+  @Test
+  public void testFromLlmRequest_withAbsentParameters() throws Exception {
+    FunctionDeclaration function =
+        FunctionDeclaration.builder().name("test_func").description("A test function").build();
+
+    Tool tool = Tool.builder().functionDeclarations(ImmutableList.of(function)).build();
+    GenerateContentConfig config =
+        GenerateContentConfig.builder().tools(ImmutableList.of(tool)).build();
+
+    LlmRequest llmRequest =
+        LlmRequest.builder()
+            .model("gemini-1.5-pro")
+            .config(config)
+            .contents(ImmutableList.of())
+            .build();
+
+    ChatCompletionsRequest request = ChatCompletionsRequest.fromLlmRequest(llmRequest, false);
+
+    assertThat(request.tools).hasSize(1);
+    Map<String, Object> params = (Map<String, Object>) request.tools.get(0).function.parameters;
+    assertThat(params.get("type")).isEqualTo("object");
+    @SuppressWarnings("unchecked")
+    Map<String, Object> props = (Map<String, Object>) params.get("properties");
+    assertThat(props).isEmpty();
+  }
+
+  @Test
+  public void testFromLlmRequest_normalizesSchemaTypeToLowerCase() throws Exception {
+    Schema param1Schema = Schema.builder().type("STRING").build();
+
+    Schema functionSchema =
+        Schema.builder().type("OBJECT").properties(ImmutableMap.of("param1", param1Schema)).build();
+
+    FunctionDeclaration function =
+        FunctionDeclaration.builder().name("test_func").parameters(functionSchema).build();
+
+    Tool tool = Tool.builder().functionDeclarations(ImmutableList.of(function)).build();
+    GenerateContentConfig config =
+        GenerateContentConfig.builder().tools(ImmutableList.of(tool)).build();
+
+    LlmRequest llmRequest =
+        LlmRequest.builder()
+            .model("gemini-1.5-pro")
+            .config(config)
+            .contents(ImmutableList.of())
+            .build();
+
+    ChatCompletionsRequest request = ChatCompletionsRequest.fromLlmRequest(llmRequest, false);
+
+    assertThat(request.tools).hasSize(1);
+    Map<String, Object> params = (Map<String, Object>) request.tools.get(0).function.parameters;
+    assertThat(params.get("type")).isEqualTo("object");
+    @SuppressWarnings("unchecked")
+    Map<String, Object> props = (Map<String, Object>) params.get("properties");
+    @SuppressWarnings("unchecked")
+    Map<String, Object> param1 = (Map<String, Object>) props.get("param1");
+    assertThat(param1.get("type")).isEqualTo("string");
+  }
+
+  @Test
   public void testFromLlmRequest_withStreamOptions() throws Exception {
     LlmRequest llmRequest =
         LlmRequest.builder().model("gemini-1.5-pro").contents(ImmutableList.of()).build();
@@ -626,11 +707,11 @@ public final class ChatCompletionsRequestTest {
 
     assertThat(request.messages.get(1).role).isEqualTo("tool");
     assertThat(request.messages.get(1).toolCallId).isEmpty();
-    assertThat(request.messages.get(1).content).isNull();
+    assertThat(request.messages.get(1).content.getValue()).isEqualTo("{}");
 
     assertThat(request.messages.get(2).role).isEqualTo("tool");
     assertThat(request.messages.get(2).toolCallId).isEqualTo("call_faulty");
-    assertThat(request.messages.get(2).content).isNull();
+    assertThat(request.messages.get(2).content.getValue()).isEqualTo("{}");
   }
 
   @Test
@@ -675,5 +756,172 @@ public final class ChatCompletionsRequestTest {
 
     assertThat(request.responseFormat)
         .isInstanceOf(ChatCompletionsRequest.ResponseFormatJsonObject.class);
+  }
+
+  // ----- thought_signature round-trip on the request side ----------------------------------
+  //
+  // The four chat source files share a single contract for round-tripping Gemini's
+  // thought_signature bytes back to the OpenAI-compatible endpoint:
+  //   - Text Parts:        Part.thoughtSignature() bytes (first text Part only) -->
+  //                        message.extra_content.google.thought_signature (base64 string).
+  //   - functionCall Parts: Part.thoughtSignature() bytes -->
+  //                         toolCall.extra_content.google.thought_signature (base64 string).
+  //   - Tool/role=tool turns: extra_content is dropped (the turn becomes a tool message and any
+  //                           captured signature is not echoed).
+  //
+  // The tests below exercise the encoding pipeline end-to-end via fromLlmRequest, complementing
+  // the existing DTO-level Jackson serialization test
+  // (testSerializeChatCompletionRequest_withToolCallsAndExtraContent) which uses a literal
+  // string and does NOT exercise byte[] handling or the conversion site.
+
+  private static final byte[] signatureBytesText = {0x01, 0x02, 0x03, 0x04};
+  private static final byte[] signatureBytesFnCall = {0x10, 0x20, 0x30, 0x40, 0x50};
+  private static final byte[] signatureBytesSecondText = {(byte) 0xff, (byte) 0xfe};
+
+  /**
+   * Asserts {@code msg.extraContent == {google: {thought_signature: base64(expected)}}} so all
+   * thought_signature encode tests share a single, precise comparison and never fall into substring
+   * matching.
+   */
+  private static void assertThoughtSignatureExtraContent(
+      Map<String, Object> extraContent, byte[] expected) {
+    assertThat(extraContent).isNotNull();
+    assertThat(extraContent).containsKey("google");
+    @SuppressWarnings("unchecked") // This code won't run in production and it is a JSON object.
+    Map<String, Object> google = (Map<String, Object>) extraContent.get("google");
+    String expectedB64 = Base64.getEncoder().encodeToString(expected);
+    assertThat(google).containsEntry("thought_signature", expectedB64);
+  }
+
+  @Test
+  public void testFromLlmRequest_textPart_withThoughtSignature_encodesAsMessageExtraContent()
+      throws Exception {
+    LlmRequest llmRequest =
+        LlmRequest.builder()
+            .model("gemini-1.5-pro")
+            .contents(
+                ImmutableList.of(
+                    Content.builder()
+                        .role("model")
+                        .parts(
+                            ImmutableList.of(
+                                Part.builder()
+                                    .text("here is the answer")
+                                    .thoughtSignature(signatureBytesText)
+                                    .build()))
+                        .build()))
+            .build();
+
+    ChatCompletionsRequest request = ChatCompletionsRequest.fromLlmRequest(llmRequest, false);
+
+    assertThat(request.messages).hasSize(1);
+    ChatCompletionsRequest.Message msg = request.messages.get(0);
+    assertThat(msg.role).isEqualTo("assistant");
+    assertThat(msg.content.getValue()).isEqualTo("here is the answer");
+    assertThoughtSignatureExtraContent(msg.extraContent, signatureBytesText);
+  }
+
+  @Test
+  public void testFromLlmRequest_multipleTextParts_firstSignatureWins() throws Exception {
+    // processContent captures only the FIRST text Part's signature. Verifies that a second
+    // signature on a later text Part is silently dropped, matching the source contract at
+    // ChatCompletionsRequest.processContent around line 377.
+    LlmRequest llmRequest =
+        LlmRequest.builder()
+            .model("gemini-1.5-pro")
+            .contents(
+                ImmutableList.of(
+                    Content.builder()
+                        .role("model")
+                        .parts(
+                            ImmutableList.of(
+                                Part.builder()
+                                    .text("first")
+                                    .thoughtSignature(signatureBytesText)
+                                    .build(),
+                                Part.builder()
+                                    .text("second")
+                                    .thoughtSignature(signatureBytesSecondText)
+                                    .build()))
+                        .build()))
+            .build();
+
+    ChatCompletionsRequest request = ChatCompletionsRequest.fromLlmRequest(llmRequest, false);
+
+    assertThat(request.messages).hasSize(1);
+    ChatCompletionsRequest.Message msg = request.messages.get(0);
+    assertThoughtSignatureExtraContent(msg.extraContent, signatureBytesText);
+  }
+
+  @Test
+  public void
+      testFromLlmRequest_functionCallPart_withThoughtSignature_encodesAsToolCallExtraContent()
+          throws Exception {
+    LlmRequest llmRequest =
+        LlmRequest.builder()
+            .model("gemini-1.5-pro")
+            .contents(
+                ImmutableList.of(
+                    Content.builder()
+                        .role("model")
+                        .parts(
+                            ImmutableList.of(
+                                Part.builder()
+                                    .functionCall(
+                                        FunctionCall.builder()
+                                            .id("call_42")
+                                            .name("get_weather")
+                                            .args(ImmutableMap.of("city", "Tokyo"))
+                                            .build())
+                                    .thoughtSignature(signatureBytesFnCall)
+                                    .build()))
+                        .build()))
+            .build();
+
+    ChatCompletionsRequest request = ChatCompletionsRequest.fromLlmRequest(llmRequest, false);
+
+    assertThat(request.messages).hasSize(1);
+    ChatCompletionsRequest.Message msg = request.messages.get(0);
+    assertThat(msg.toolCalls).hasSize(1);
+    ChatCompletionsCommon.ToolCall toolCall = msg.toolCalls.get(0);
+    assertThat(toolCall.id).isEqualTo("call_42");
+    assertThat(toolCall.function.name).isEqualTo("get_weather");
+    assertThoughtSignatureExtraContent(toolCall.extraContent, signatureBytesFnCall);
+    // The message-level extraContent must remain null when there is no text Part with a sig.
+    assertThat(msg.extraContent).isNull();
+  }
+
+  @Test
+  public void testFromLlmRequest_functionResponseTurn_dropsSignature() throws Exception {
+    // role=tool turns return early in processContent and yield zero or more "tool" Messages
+    // built from function responses. Any thought_signature on the source Parts -- which would
+    // not make sense on a tool turn anyway -- must NOT leak into the emitted tool Messages
+    // via extra_content.
+    LlmRequest llmRequest =
+        LlmRequest.builder()
+            .model("gemini-1.5-pro")
+            .contents(
+                ImmutableList.of(
+                    Content.builder()
+                        .role("tool")
+                        .parts(
+                            ImmutableList.<Part>of(
+                                Part.builder()
+                                    .functionResponse(
+                                        FunctionResponse.builder()
+                                            .id("call_x")
+                                            .response(ImmutableMap.of("ok", true))
+                                            .build())
+                                    .thoughtSignature(signatureBytesText)
+                                    .build()))
+                        .build()))
+            .build();
+
+    ChatCompletionsRequest request = ChatCompletionsRequest.fromLlmRequest(llmRequest, false);
+
+    assertThat(request.messages).hasSize(1);
+    ChatCompletionsRequest.Message toolMsg = request.messages.get(0);
+    assertThat(toolMsg.role).isEqualTo("tool");
+    assertThat(toolMsg.extraContent).isNull();
   }
 }

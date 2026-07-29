@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      https://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,16 +21,23 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonValue;
+import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonSerializer;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.google.adk.JsonBaseModel;
 import com.google.adk.models.LlmRequest;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.genai.types.Content;
 import com.google.genai.types.FunctionDeclaration;
 import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.GenerateContentConfig;
 import com.google.genai.types.Part;
+import com.google.genai.types.Type;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -269,7 +276,28 @@ public final class ChatCompletionsRequest {
   public Map<String, Object> extraBody;
 
   private static final Logger logger = LoggerFactory.getLogger(ChatCompletionsRequest.class);
-  private static final ObjectMapper objectMapper = JsonBaseModel.getMapper();
+
+  /**
+   * Registers a custom serializer to force JSON Schema types to lowercase (e.g., "STRING" ->
+   * "string"). The genai SDK uses uppercase Enums for schema types, which strict OpenAI-compatible
+   * endpoints reject with HTTP 400.
+   */
+  private static SimpleModule schemaNormalizerModule() {
+    SimpleModule module = new SimpleModule();
+    module.addSerializer(
+        Type.class,
+        new JsonSerializer<Type>() {
+          @Override
+          public void serialize(Type value, JsonGenerator gen, SerializerProvider serializers)
+              throws IOException {
+            gen.writeString(value.toString().toLowerCase());
+          }
+        });
+    return module;
+  }
+
+  private static final ObjectMapper objectMapper =
+      JsonBaseModel.getMapper().copy().registerModule(schemaNormalizerModule());
 
   /**
    * Converts a standard {@link LlmRequest} into a {@link ChatCompletionsRequest} for
@@ -351,41 +379,43 @@ public final class ChatCompletionsRequest {
     List<ChatCompletionsCommon.ToolCall> toolCalls = new ArrayList<>();
     List<Message> toolResponses = new ArrayList<>();
     List<String> refusals = new ArrayList<>();
+    // Capture a message-level thought_signature from the first text Part that carries one.
+    // This signature must be echoed back on subsequent turns to ensure proper round-tripping.
+    byte[] textThoughtSignature = null;
 
-    content
-        .parts()
-        .ifPresent(
-            parts -> {
-              for (Part part : parts) {
-                if (part.text().isPresent()) {
-                  // Text Parts may carry refusal content prefixed with REFUSAL_PREFIX.
-                  ChatCompletionsCommon.RefusalSplit split =
-                      ChatCompletionsCommon.parseRefusalPrefix(part.text().get());
-                  if (split.content() != null) {
-                    ContentPart textPart = new ContentPart();
-                    textPart.type = "text";
-                    textPart.text = split.content();
-                    contentParts.add(textPart);
-                  }
-                  if (split.refusal() != null) {
-                    refusals.add(split.refusal());
-                  }
-                } else if (part.inlineData().isPresent()) {
-                  contentParts.add(processInlineDataPart(part));
-                } else if (part.fileData().isPresent()) {
-                  contentParts.add(processFileDataPart(part));
-                } else if (part.functionCall().isPresent()) {
-                  toolCalls.add(processFunctionCallPart(part));
-                } else if (part.functionResponse().isPresent()) {
-                  toolResponses.add(processFunctionResponsePart(part));
-                } else if (part.executableCode().isPresent()) {
-                  logger.warn("Executable code is not supported in Chat Completion conversion");
-                } else if (part.codeExecutionResult().isPresent()) {
-                  logger.warn(
-                      "Code execution result is not supported in Chat Completion conversion");
-                }
-              }
-            });
+    if (content.parts().isPresent()) {
+      for (Part part : content.parts().get()) {
+        if (part.text().isPresent()) {
+          // Text Parts may carry refusal content prefixed with REFUSAL_PREFIX.
+          ChatCompletionsCommon.RefusalSplit split =
+              ChatCompletionsCommon.parseRefusalPrefix(part.text().get());
+          if (split.content() != null) {
+            ContentPart textPart = new ContentPart();
+            textPart.type = "text";
+            textPart.text = split.content();
+            contentParts.add(textPart);
+          }
+          if (split.refusal() != null) {
+            refusals.add(split.refusal());
+          }
+          if (textThoughtSignature == null && part.thoughtSignature().isPresent()) {
+            textThoughtSignature = part.thoughtSignature().get();
+          }
+        } else if (part.inlineData().isPresent()) {
+          contentParts.add(processInlineDataPart(part));
+        } else if (part.fileData().isPresent()) {
+          contentParts.add(processFileDataPart(part));
+        } else if (part.functionCall().isPresent()) {
+          toolCalls.add(processFunctionCallPart(part));
+        } else if (part.functionResponse().isPresent()) {
+          toolResponses.add(processFunctionResponsePart(part));
+        } else if (part.executableCode().isPresent()) {
+          logger.warn("Executable code is not supported in Chat Completion conversion");
+        } else if (part.codeExecutionResult().isPresent()) {
+          logger.warn("Code execution result is not supported in Chat Completion conversion");
+        }
+      }
+    }
 
     if (!toolResponses.isEmpty()) {
       return toolResponses;
@@ -402,6 +432,14 @@ public final class ChatCompletionsRequest {
         } else {
           msg.content = new MessageContent(ImmutableList.copyOf(contentParts));
         }
+      }
+      // Round-trip the message-level thought_signature for assistant text responses.
+      if (textThoughtSignature != null) {
+        msg.extraContent =
+            ImmutableMap.of(
+                "google",
+                ImmutableMap.of(
+                    "thought_signature", Base64.getEncoder().encodeToString(textThoughtSignature)));
       }
       List<Message> messages = new ArrayList<>();
       messages.add(msg);
@@ -446,6 +484,10 @@ public final class ChatCompletionsRequest {
   /**
    * Processes a function call part and returns a mapped ToolCall.
    *
+   * <p>If the source {@link Part} carries a {@code thoughtSignature}, it is round-tripped back out
+   * as a base64-encoded string in {@code extra_content.google.thought_signature} to satisfy
+   * endpoint requirements.
+   *
    * @param part The input part containing a requested function call or invocation.
    * @return The mapped function call tool call.
    */
@@ -461,9 +503,19 @@ public final class ChatCompletionsRequest {
         function.arguments = objectMapper.writeValueAsString(fc.args().get());
       } catch (Exception e) {
         logger.warn("Failed to serialize function arguments", e);
+        function.arguments = ChatCompletionsCommon.EMPTY_JSON_OBJECT;
       }
+    } else {
+      function.arguments = ChatCompletionsCommon.EMPTY_JSON_OBJECT;
     }
     toolCall.function = function;
+    part.thoughtSignature()
+        .ifPresent(
+            sigBytes -> {
+              String sig = Base64.getEncoder().encodeToString(sigBytes);
+              toolCall.extraContent =
+                  ImmutableMap.of("google", ImmutableMap.of("thought_signature", sig));
+            });
     return toolCall;
   }
 
@@ -483,7 +535,10 @@ public final class ChatCompletionsRequest {
         toolResp.content = new MessageContent(objectMapper.writeValueAsString(fr.response().get()));
       } catch (Exception e) {
         logger.warn("Failed to serialize tool response", e);
+        toolResp.content = new MessageContent(ChatCompletionsCommon.EMPTY_JSON_OBJECT);
       }
+    } else {
+      toolResp.content = new MessageContent(ChatCompletionsCommon.EMPTY_JSON_OBJECT);
     }
     return toolResp;
   }
@@ -548,12 +603,15 @@ public final class ChatCompletionsRequest {
             FunctionDefinition def = new FunctionDefinition();
             def.name = fd.name().orElse("");
             def.description = fd.description().orElse("");
-            fd.parameters()
-                .ifPresent(
-                    params ->
-                        def.parameters =
-                            objectMapper.convertValue(
-                                params, new TypeReference<Map<String, Object>>() {}));
+            if (fd.parameters().isPresent()) {
+              def.parameters =
+                  objectMapper.convertValue(
+                      fd.parameters().get(), new TypeReference<Map<String, Object>>() {});
+            } else {
+              // OpenAI-compatible APIs (like Groq) strictly require the parameters object
+              // to exist, even for zero-argument functions.
+              def.parameters = ChatCompletionsCommon.EMPTY_PARAMETERS_SCHEMA;
+            }
             tool.function = def;
             tools.add(tool);
           }
@@ -616,6 +674,13 @@ public final class ChatCompletionsRequest {
 
     /** See class definition for more details. */
     public String refusal;
+
+    /**
+     * Message-level additional parameters used by some providers. Used for round-tripping data like
+     * {@code extra_content.google.thought_signature}.
+     */
+    @JsonProperty("extra_content")
+    public Map<String, Object> extraContent;
   }
 
   /**
