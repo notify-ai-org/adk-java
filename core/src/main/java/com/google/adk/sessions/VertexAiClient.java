@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.google.adk.sessions;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -8,6 +24,7 @@ import com.google.adk.JsonBaseModel;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.common.base.Splitter;
 import com.google.common.collect.Iterables;
+import com.google.common.net.UrlEscapers;
 import com.google.genai.types.HttpOptions;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Maybe;
@@ -104,18 +121,33 @@ final class VertexAiClient {
   }
 
   Maybe<JsonNode> listSessions(String reasoningEngineId, String userId) {
+    // Send the user id as a quoted AIP-160 literal so its contents cannot alter
+    // the filter, then URL-escape the whole filter for transport.
+    String filter = "user_id=" + quoteFilterLiteral(userId);
     return performApiRequest(
             "GET",
-            "reasoningEngines/" + reasoningEngineId + "/sessions?filter=user_id=" + userId,
+            "reasoningEngines/"
+                + reasoningEngineId
+                + "/sessions?filter="
+                + UrlEscapers.urlFormParameterEscaper().escape(filter),
             "")
         .flatMapMaybe(VertexAiClient::getJsonResponse);
   }
 
-  Maybe<JsonNode> listEvents(String reasoningEngineId, String sessionId) {
-    return performApiRequest(
-            "GET",
-            "reasoningEngines/" + reasoningEngineId + "/sessions/" + sessionId + "/events",
-            "")
+  /**
+   * Wraps a value in an AIP-160 double-quoted string literal. Per go/aip/160, only backslashes and
+   * double quotes need escaping inside the quotes.
+   */
+  private static String quoteFilterLiteral(String value) {
+    return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+  }
+
+  Maybe<JsonNode> listEvents(String reasoningEngineId, String sessionId, @Nullable String filter) {
+    String path = "reasoningEngines/" + reasoningEngineId + "/sessions/" + sessionId + "/events";
+    if (filter != null) {
+      path += "?filter=" + UrlEscapers.urlFormParameterEscaper().escape(filter);
+    }
+    return performApiRequest("GET", path, "")
         .doOnSuccess(apiResponse -> logger.debug("List events response {}", apiResponse))
         .flatMapMaybe(VertexAiClient::getJsonResponse);
   }

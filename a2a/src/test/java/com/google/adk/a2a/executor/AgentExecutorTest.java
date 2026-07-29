@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.google.adk.a2a.executor;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
@@ -12,6 +28,7 @@ import static org.mockito.Mockito.when;
 
 import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.InvocationContext;
+import com.google.adk.agents.RunConfig;
 import com.google.adk.apps.App;
 import com.google.adk.artifacts.InMemoryArtifactService;
 import com.google.adk.events.Event;
@@ -24,6 +41,7 @@ import com.google.genai.types.Part;
 import io.a2a.server.agentexecution.RequestContext;
 import io.a2a.server.events.EventQueue;
 import io.a2a.spec.Message;
+import io.a2a.spec.MessageSendParams;
 import io.a2a.spec.TaskArtifactUpdateEvent;
 import io.a2a.spec.TaskState;
 import io.a2a.spec.TaskStatus;
@@ -342,6 +360,62 @@ public final class AgentExecutorTest {
     assertThat(statusEvents).isEmpty();
   }
 
+  @Test
+  public void execute_propagatesRequestMetadataIntoRunConfig() {
+    testAgent.setEventsToEmit(Flowable.empty());
+    AgentExecutor executor =
+        new AgentExecutor.Builder()
+            .agentExecutorConfig(AgentExecutorConfig.builder().build())
+            .app(App.builder().name("test_app").rootAgent(testAgent).build())
+            .sessionService(new InMemorySessionService())
+            .artifactService(new InMemoryArtifactService())
+            .build();
+
+    Message message =
+        new Message.Builder()
+            .messageId("msg-1")
+            .role(Message.Role.USER)
+            .parts(ImmutableList.of(new TextPart("trigger")))
+            .build();
+    MessageSendParams params =
+        new MessageSendParams.Builder()
+            .message(message)
+            .metadata(ImmutableMap.of("key", "value"))
+            .build();
+    RequestContext ctx = mock(RequestContext.class);
+    when(ctx.getMessage()).thenReturn(message);
+    when(ctx.getTaskId()).thenReturn("task-1");
+    when(ctx.getContextId()).thenReturn("ctx-1");
+    when(ctx.getParams()).thenReturn(params);
+
+    executor.execute(ctx, eventQueue);
+
+    // The runner passes the enriched run config down to the agent's invocation context.
+    RunConfig runConfig = testAgent.lastInvocationContext.runConfig();
+    assertThat(runConfig.customMetadata())
+        .containsEntry("a2a_metadata", ImmutableMap.of("key", "value"));
+  }
+
+  @Test
+  public void execute_withoutRequestMetadata_leavesRunConfigCustomMetadataEmpty() {
+    testAgent.setEventsToEmit(Flowable.empty());
+    AgentExecutor executor =
+        new AgentExecutor.Builder()
+            .agentExecutorConfig(AgentExecutorConfig.builder().build())
+            .app(App.builder().name("test_app").rootAgent(testAgent).build())
+            .sessionService(new InMemorySessionService())
+            .artifactService(new InMemoryArtifactService())
+            .build();
+
+    // createRequestContext() does not stub getParams(), mirroring a request with no metadata.
+    RequestContext ctx = createRequestContext();
+
+    executor.execute(ctx, eventQueue);
+
+    RunConfig runConfig = testAgent.lastInvocationContext.runConfig();
+    assertThat(runConfig.customMetadata()).doesNotContainKey("a2a_metadata");
+  }
+
   private RequestContext createRequestContext() {
     Message message =
         new Message.Builder()
@@ -507,6 +581,7 @@ public final class AgentExecutorTest {
 
   private static final class TestAgent extends BaseAgent {
     private Flowable<Event> eventsToEmit;
+    private volatile InvocationContext lastInvocationContext;
 
     TestAgent() {
       this(Flowable.empty());
@@ -524,6 +599,7 @@ public final class AgentExecutorTest {
 
     @Override
     protected Flowable<Event> runAsyncImpl(InvocationContext invocationContext) {
+      this.lastInvocationContext = invocationContext;
       return eventsToEmit;
     }
 

@@ -40,13 +40,16 @@ public final class SchemaUtils {
    */
   @SuppressWarnings("unchecked") // For tool parameter type casting.
   private static Boolean matchType(Object value, Schema schema, Boolean isInput) {
+    if (value == null) {
+      return schema.nullable().orElse(false);
+    }
     // Based on types from https://cloud.google.com/vertex-ai/docs/reference/rest/v1/Schema
     Type.Known type = schema.type().get().knownEnum();
     switch (type) {
       case STRING:
         return value instanceof String;
       case INTEGER:
-        return value instanceof Integer;
+        return value instanceof Integer || value instanceof Long;
       case BOOLEAN:
         return value instanceof Boolean;
       case NUMBER:
@@ -72,7 +75,6 @@ public final class SchemaUtils {
         throw new IllegalArgumentException(
             "Unsupported type: " + type + " is not a Open API data type.");
       default:
-        // This category includes NULL, which is not supported.
         break;
     }
     return false;

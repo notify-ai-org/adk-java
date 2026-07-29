@@ -51,20 +51,34 @@ import com.google.cloud.bigquery.StandardTableDefinition;
 import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.TableInfo;
+import com.google.cloud.bigquery.TimePartitioning;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.genai.types.Content;
+import com.google.genai.types.CustomMetadata;
+import com.google.genai.types.FunctionCall;
+import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Maybe;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.jspecify.annotations.Nullable;
@@ -88,11 +102,27 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
           "adk_request_input",
           "HITL_INPUT_REQUEST");
 
+  // pause_kind discriminator for TOOL_PAUSED rows, keyed by the synthetic HITL function-call NAME
+  // (mirrors the Python plugin's _HITL_PAUSE_KIND_MAP). Long-running calls that are not HITL carry
+  // pause_kind = "tool".
+  private static final ImmutableMap<String, String> HITL_PAUSE_KIND_MAP =
+      ImmutableMap.of(
+          "adk_request_credential",
+          "hitl_credential",
+          "adk_request_confirmation",
+          "hitl_confirmation",
+          "adk_request_input",
+          "hitl_input");
+
   private final BigQueryLoggerConfig config;
   private final BigQuery bigQuery;
   private final Object tableEnsuredLock = new Object();
   private final PluginState state;
   private volatile boolean tableEnsured = false;
+  // Set only on the public construction paths (see registerShutdownHook); null for the
+  // package-private test constructor. Deregistered in close() so an explicit close does not leave
+  // the hook pinning this plugin for the JVM's lifetime.
+  private @Nullable Thread shutdownHook;
 
   public BigQueryAgentAnalyticsPlugin(BigQueryLoggerConfig config) throws IOException {
     this(config, createBigQuery(config));
@@ -101,6 +131,9 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
   public BigQueryAgentAnalyticsPlugin(BigQueryLoggerConfig config, BigQuery bigQuery)
       throws IOException {
     this(config, bigQuery, new PluginState(config));
+    // Register on the public construction paths only (not the package-private test constructor),
+    // so a host that never calls close() still gets a best-effort drain at JVM exit.
+    registerShutdownHook();
   }
 
   BigQueryAgentAnalyticsPlugin(BigQueryLoggerConfig config, BigQuery bigQuery, PluginState state) {
@@ -108,6 +141,43 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     this.config = config;
     this.bigQuery = bigQuery;
     this.state = state;
+  }
+
+  private void registerShutdownHook() {
+    shutdownHook =
+        new Thread(
+            () -> {
+              try {
+                boolean unused =
+                    state
+                        .close()
+                        .blockingAwait(config.shutdownTimeout().toMillis(), TimeUnit.MILLISECONDS);
+              } catch (RuntimeException e) {
+                logger.log(Level.WARNING, "Error draining BQAA analytics on JVM shutdown", e);
+              }
+            },
+            "bq-analytics-shutdown");
+    Runtime.getRuntime().addShutdownHook(shutdownHook);
+  }
+
+  private void removeShutdownHook() {
+    if (shutdownHook == null) {
+      return;
+    }
+    try {
+      Runtime.getRuntime().removeShutdownHook(shutdownHook);
+    } catch (IllegalStateException e) {
+      // The JVM is already shutting down; the hook is running (or has run) and cannot be removed.
+    }
+  }
+
+  /**
+   * Returns aggregated dropped-row counters keyed by reason ({@code queue_full}, {@code
+   * append_error}, {@code serialization_error}). Non-zero values indicate analytics rows that never
+   * reached BigQuery.
+   */
+  public ImmutableMap<String, Long> getDropStats() {
+    return state.getDropStats();
   }
 
   private static BigQuery createBigQuery(BigQueryLoggerConfig config) throws IOException {
@@ -129,24 +199,36 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     if (!tableEnsured) {
       synchronized (tableEnsuredLock) {
         if (!tableEnsured) {
-          // Table creation is expensive, so we only do it once per plugin instance.
-          tableEnsured = true;
-          ensureTableExists(bigQuery, config);
+          // Only mark the table as ensured after a successful setup, so a transient first-run
+          // failure (auth blip, missing dataset, quota) is retried on subsequent events instead
+          // of permanently disabling table creation/upgrade for this plugin instance.
+          if (ensureTableExists(bigQuery, config)) {
+            tableEnsured = true;
+          }
         }
       }
     }
   }
 
-  private void ensureTableExists(BigQuery bigQuery, BigQueryLoggerConfig config) {
+  /** Returns true if the events table is present (created or already existed) and ready. */
+  private boolean ensureTableExists(BigQuery bigQuery, BigQueryLoggerConfig config) {
     TableId tableId = TableId.of(config.projectId(), config.datasetId(), config.tableName());
     Schema schema = BigQuerySchema.getEventsSchema();
+    boolean tableReady = false;
     try {
       Table table = bigQuery.getTable(tableId);
-      logger.info("BigQuery table: " + tableId);
+      logger.fine("BigQuery table: " + tableId);
       if (table == null) {
         logger.info("Creating BigQuery table: " + tableId);
         StandardTableDefinition.Builder tableDefinitionBuilder =
-            StandardTableDefinition.newBuilder().setSchema(schema);
+            StandardTableDefinition.newBuilder()
+                .setSchema(schema)
+                // Day-partition on the event timestamp for cost/pruning parity with the Python
+                // plugin. Time-filtered analytics queries prune partitions instead of full scans.
+                .setTimePartitioning(
+                    TimePartitioning.newBuilder(TimePartitioning.Type.DAY)
+                        .setField("timestamp")
+                        .build());
         if (!config.clusteringFields().isEmpty()) {
           tableDefinitionBuilder.setClustering(
               Clustering.newBuilder().setFields(config.clusteringFields()).build());
@@ -157,9 +239,24 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
                     ImmutableMap.of(
                         BigQuerySchema.SCHEMA_VERSION_LABEL_KEY, BigQuerySchema.SCHEMA_VERSION))
                 .build();
-        bigQuery.create(tableInfo);
+        try {
+          bigQuery.create(tableInfo);
+        } catch (BigQueryException e) {
+          // Another writer may have created the table concurrently; treat that as success.
+          String msg = e.getMessage();
+          if (msg != null && msg.toLowerCase(Locale.ROOT).contains("already exists")) {
+            logger.info("BigQuery table already exists (concurrent create): " + tableId);
+          } else {
+            throw e;
+          }
+        }
+        tableReady = true;
       } else if (config.autoSchemaUpgrade()) {
-        maybeUpgradeSchema(bigQuery, table);
+        // Only treat the table as ready if the schema upgrade actually succeeded, so a failed
+        // upgrade is retried on a later event instead of being masked by tableEnsured=true.
+        tableReady = maybeUpgradeSchema(bigQuery, table);
+      } else {
+        tableReady = true;
       }
     } catch (BigQueryException e) {
       processBigQueryException(e, "Failed to check or create/upgrade BigQuery table: " + tableId);
@@ -174,6 +271,7 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     } catch (RuntimeException e) {
       logger.log(Level.WARNING, "Failed to create/update BigQuery views for table: " + tableId, e);
     }
+    return tableReady;
   }
 
   private void processBigQueryException(BigQueryException e, String logMessage) {
@@ -230,7 +328,7 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     Map<String, Object> row = new HashMap<>();
     row.put("timestamp", Instant.now());
     row.put("event_type", eventType);
-    row.put("agent", invocationContext.agent().name());
+    row.put("agent", resolveAgentName(invocationContext, eventData));
     row.put("session_id", invocationContext.session().id());
     row.put("invocation_id", invocationContext.invocationId());
     row.put("user_id", invocationContext.userId());
@@ -246,7 +344,13 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     if (latencyMap != null) {
       row.put("latency_ms", convertToJsonNode(latencyMap));
     }
-    row.put("attributes", convertToJsonNode(getAttributes(data, invocationContext)));
+    // Redact the complete assembled attributes tree at the output boundary, regardless of which
+    // producer populated it (state deltas, custom tags, labels, extra attributes). redactTree
+    // walks raw containers and fails CLOSED on unserializable values (one bad custom tag or
+    // session-state object must not route the whole map through a textual fallback that would
+    // expose sibling secrets). Redaction intentionally does not set is_truncated (parity with the
+    // Python plugin).
+    row.put("attributes", JsonFormatter.redactTree(getAttributes(data, invocationContext)));
 
     CompletableFuture<Void> parseFuture;
     if (content != null) {
@@ -281,14 +385,86 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
       parseFuture = CompletableFuture.completedFuture(null);
     }
 
+    // Capture the durable lifecycle token NOW, while the invocation is active: the continuation
+    // below may complete arbitrarily late (e.g. after a parse/offload timeout), and the captured
+    // token — unlike the bounded processed-invocations cache — cannot be evicted, so a late
+    // completion can never resurrect a processor for a finalized invocation.
+    PluginState.InvocationLifecycle lifecycle =
+        state.getLifecycle(invocationContext.invocationId());
     CompletableFuture<Void> appendFuture =
         parseFuture.thenRun(
-            () -> {
-              BatchProcessor processor = state.getBatchProcessor(invocationContext.invocationId());
-              processor.append(row);
-            });
+            // appendRow enforces the invocation lifecycle gate and accounts for writer
+            // construction failures instead of losing the row silently.
+            () -> state.appendRow(lifecycle, invocationContext.invocationId(), row));
     state.addPendingTask(invocationContext.invocationId(), appendFuture);
     return Completable.complete();
+  }
+
+  /**
+   * Resolves the agent name defensively. Workflow-driven callbacks may have no current agent; fall
+   * back to the event author (via {@code EventData.fallbackAgentName}, mirroring the Python plugin)
+   * and finally to a sentinel, rather than letting an NPE drop the row.
+   */
+  private static String resolveAgentName(
+      InvocationContext invocationContext, Optional<EventData> eventData) {
+    BaseAgent agent = null;
+    try {
+      // Only the agent() lookup can throw; keep the guarded region narrow so a genuinely present
+      // agent still yields its (validated, non-null) name rather than being swallowed.
+      agent = invocationContext.agent();
+    } catch (RuntimeException e) {
+      // Fall through to the author/sentinel fallback below.
+    }
+    if (agent != null) {
+      return agent.name();
+    }
+    return eventData.flatMap(EventData::fallbackAgentName).orElse("unknown");
+  }
+
+  // Synthetic operation identities for tool calls whose function-call ID is absent: the framework
+  // materializes ToolContext.functionCallId as "" when the model omitted the ID, so two concurrent
+  // id-less calls would collide on "" and cross-pop each other's spans. The same ToolContext
+  // instance flows through the before/after/error callbacks of one call, so it keys a unique
+  // synthetic ID; weakKeys gives identity semantics plus GC-based cleanup for calls whose
+  // completion callback never fires.
+  private final Cache<ToolContext, String> syntheticToolCallIds =
+      CacheBuilder.newBuilder().weakKeys().build();
+
+  /**
+   * Operation identity for a tool call's span: the real function-call ID when present and
+   * non-empty, else a per-ToolContext synthetic ID (see {@link #syntheticToolCallIds}).
+   */
+  private String toolOperationId(ToolContext toolContext) {
+    String id = toolContext.functionCallId().orElse("");
+    if (!id.isEmpty()) {
+      return id;
+    }
+    return syntheticToolCallIds
+        .asMap()
+        .computeIfAbsent(toolContext, tc -> "tool-ctx-" + UUID.randomUUID());
+  }
+
+  /**
+   * Pause/resume pair keys for a HITL completion row: {@code pause_kind} derived from the synthetic
+   * call name and, when the response carries one, the {@code function_call_id} that joins the
+   * completion to its HITL_*_REQUEST / TOOL_PAUSED rows.
+   */
+  private static ImmutableMap<String, Object> hitlPairKeys(
+      String hitlName, Optional<String> functionCallId) {
+    ImmutableMap.Builder<String, Object> keys = ImmutableMap.builder();
+    keys.put("pause_kind", HITL_PAUSE_KIND_MAP.getOrDefault(hitlName, "tool"));
+    // The framework materializes an absent ID as "", which is useless as a join key.
+    functionCallId.filter(id -> !id.isEmpty()).ifPresent(id -> keys.put("function_call_id", id));
+    return keys.buildOrThrow();
+  }
+
+  @CanIgnoreReturnValue
+  private static EventData.Builder withFallbackAgent(
+      EventData.Builder builder, @Nullable String author) {
+    if (author != null && !author.isEmpty()) {
+      builder.setFallbackAgentName(author);
+    }
+    return builder;
   }
 
   private ResolvedTraceIds getResolvedTraceIds(
@@ -298,8 +474,11 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
         eventData
             .flatMap(EventData::traceIdOverride)
             .orElseGet(() -> traceManager.getTraceId(invocationContext));
-    Optional<SpanIds> ambientSpanIds = traceManager.getAmbientSpanAndParent();
-    SpanIds spanIds = ambientSpanIds.orElse(traceManager.getCurrentSpanAndParent());
+    // span_id / parent_span_id must reference the BQAA internal execution tree (spans that are
+    // written as rows), not an ambient OpenTelemetry framework span that is never logged as a row.
+    // Otherwise parent_span_id would dangle. Ambient OTel still governs trace_id (via getTraceId)
+    // for cross-system correlation.
+    SpanIds spanIds = traceManager.getCurrentSpanAndParent(invocationContext);
 
     return new ResolvedTraceIds(
         traceId,
@@ -325,6 +504,9 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
       EventData eventData, InvocationContext invocationContext) {
     Map<String, Object> attributes = new HashMap<>(eventData.extraAttributes());
     TraceManager traceManager = state.getTraceManager(invocationContext.invocationId());
+    // Populate the root agent name from the invocation context if it has not been set yet, so
+    // attributes.root_agent_name is a real name rather than the sentinel default.
+    traceManager.initTraceIfNeeded(invocationContext);
     attributes.put("root_agent_name", traceManager.getRootAgentName());
     eventData.model().ifPresent(m -> attributes.put("model", m));
     eventData.modelVersion().ifPresent(mv -> attributes.put("model_version", mv));
@@ -345,7 +527,13 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
         sessionMeta.put("user_id", session.userId());
 
         if (!session.state().isEmpty()) {
-          TruncationResult result = smartTruncate(session.state(), config.maxContentLength());
+          // Redact BEFORE truncating: smartTruncate's whole-object fallback stringifies the map
+          // when one value is unserializable, which would put embedded secrets beyond the reach
+          // of the final redaction boundary (a string leaf has no keys to redact). redactTree is
+          // fail-closed per leaf and returns a JsonNode, which smartTruncate then length-bounds
+          // without ever hitting the textual fallback.
+          TruncationResult result =
+              smartTruncate(JsonFormatter.redactTree(session.state()), config.maxContentLength());
           sessionMeta.put("state", toJavaObject(result.node()));
         }
         attributes.put("session_metadata", sessionMeta);
@@ -366,7 +554,9 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
 
   @Override
   public Completable close() {
-    return state.close();
+    // Deregister the JVM shutdown hook first: an explicit close() supersedes the best-effort drain
+    // at exit, and leaving the hook registered would pin this plugin for the JVM's lifetime.
+    return Completable.fromRunnable(this::removeShutdownHook).andThen(state.close());
   }
 
   @VisibleForTesting
@@ -374,31 +564,29 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     return state;
   }
 
-  private Optional<EventData> getCompletedEventData(InvocationContext invocationContext) {
+  private Optional<EventData> getCompletedEventData(
+      InvocationContext invocationContext, String expectedKindPrefix) {
     TraceManager traceManager = state.getTraceManager(invocationContext.invocationId());
     String traceId = traceManager.getTraceId(invocationContext);
-    // Pop the invocation span from the trace manager.
-    Optional<RecordData> popped = traceManager.popSpan();
+    // Pop the completed span (of the expected kind) from the trace manager.
+    Optional<RecordData> popped = traceManager.popSpan(invocationContext, expectedKindPrefix);
     if (popped.isEmpty()) {
-      // No invocation span to pop.
-      logger.info("No invocation span to pop.");
+      // No matching span to pop.
+      logger.info("No span with kind prefix '" + expectedKindPrefix + "' to pop.");
       return Optional.empty();
     }
-    Optional<String> parentSpanId = traceManager.getCurrentSpanId();
+    Optional<String> parentSpanId = traceManager.getCurrentSpanId(invocationContext);
 
     EventData.Builder eventDataBuilder = EventData.builder();
     eventDataBuilder.setTraceIdOverride(traceId);
     eventDataBuilder.setLatency(popped.get().duration());
-    // Only override span IDs when no ambient OTel span exists.
-    // Keep STARTING/COMPLETED pairs consistent.
-    if (!traceManager.hasAmbientSpan()) {
-      if (parentSpanId.isPresent()) {
-        eventDataBuilder.setParentSpanIdOverride(parentSpanId.get());
-      }
-      if (popped.get().spanId() != null) {
-        eventDataBuilder.setSpanIdOverride(popped.get().spanId());
-      }
+    // Always record the internal execution-tree span so the STARTING/COMPLETED pair stays
+    // internally joinable and parent_span_id references a logged row, regardless of ambient OTel.
+    if (parentSpanId.isPresent()) {
+      eventDataBuilder.setParentSpanIdOverride(parentSpanId.get());
     }
+    // RecordData.spanId() is always populated by the trace manager, so record it unconditionally.
+    eventDataBuilder.setSpanIdOverride(popped.get().spanId());
     return Optional.of(eventDataBuilder.build());
   }
 
@@ -413,24 +601,59 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     Completable logCompletable =
         logEvent("USER_MESSAGE_RECEIVED", invocationContext, userMessage, Optional.empty());
 
+    // Resumed input arrives in the user message as FunctionResponse parts (a FunctionCall never
+    // appears here): HITL responses complete their HITL_*_REQUEST / TOOL_PAUSED pair, and a
+    // non-HITL FunctionResponse is by construction the resume side of a paused long-running tool
+    // (regular tools complete inside the agent run via afterToolCallback), so it emits
+    // TOOL_COMPLETED carrying the pause pair keys.
     if (userMessage.parts().isPresent()) {
       for (Part part : userMessage.parts().get()) {
-        if (part.functionCall().isPresent()
-            && HITL_EVENT_TYPES.containsKey(part.functionCall().get().name().orElse(""))) {
-          String hitlEvent = HITL_EVENT_TYPES.get(part.functionCall().get().name().get());
-          TruncationResult truncatedResult = smartTruncate(part, config.maxContentLength());
+        if (part.functionResponse().isEmpty()) {
+          continue;
+        }
+        FunctionResponse functionResponse = part.functionResponse().get();
+        String responseName = functionResponse.name().orElse("");
+        TruncationResult truncatedResult =
+            smartTruncate(functionResponse.response(), config.maxContentLength());
+        ImmutableMap<String, Object> contentMap =
+            ImmutableMap.of("tool", responseName, "result", truncatedResult.node());
+        if (HITL_EVENT_TYPES.containsKey(responseName)) {
+          // HITL completions stay on the HITL_*_COMPLETED stream — they must not also emit
+          // TOOL_COMPLETED. The pair keys make the completion joinable to its HITL_*_REQUEST /
+          // TOOL_PAUSED rows even when multiple HITL requests share an invocation.
           logCompletable =
               logCompletable.andThen(
                   logEvent(
-                      hitlEvent + "_COMPLETED",
+                      HITL_EVENT_TYPES.get(responseName) + "_COMPLETED",
                       invocationContext,
-                      ImmutableMap.of(
-                          "tool",
-                          part.functionCall().get().name().get(),
-                          "result",
-                          truncatedResult.node()),
+                      contentMap,
                       truncatedResult.isTruncated(),
-                      Optional.empty()));
+                      Optional.of(
+                          EventData.builder()
+                              .setExtraAttributes(hitlPairKeys(responseName, functionResponse.id()))
+                              .build())));
+        } else {
+          if (functionResponse.id().isEmpty()) {
+            logger.fine(
+                "User-message function response for tool "
+                    + responseName
+                    + " has no id; the resulting TOOL_COMPLETED row cannot pair with a TOOL_PAUSED"
+                    + " row.");
+          }
+          ImmutableMap.Builder<String, Object> pairKeys = ImmutableMap.builder();
+          pairKeys.put("pause_kind", "tool");
+          functionResponse.id().ifPresent(id -> pairKeys.put("function_call_id", id));
+          logCompletable =
+              logCompletable.andThen(
+                  logEvent(
+                      "TOOL_COMPLETED",
+                      invocationContext,
+                      contentMap,
+                      truncatedResult.isTruncated(),
+                      Optional.of(
+                          EventData.builder()
+                              .setExtraAttributes(pairKeys.buildOrThrow())
+                              .build())));
         }
       }
     }
@@ -442,60 +665,186 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     if (state.isProcessed(invocationContext.invocationId())) {
       return Maybe.empty();
     }
-    EventData.Builder eventDataBuilder =
-        EventData.builder()
-            .setExtraAttributes(
-                ImmutableMap.<String, Object>builder()
-                    .put("state_delta", event.actions().stateDelta())
-                    .put("author", event.author())
-                    .buildOrThrow());
-    Completable logCompletable =
-        logEvent(
-            "STATE_DELTA",
-            invocationContext,
-            event.content().orElse(null),
-            Optional.of(eventDataBuilder.build()));
+    // Only emit STATE_DELTA when there is an actual state change, matching the Python plugin
+    // (which does not write a STATE_DELTA row for events with an empty state delta).
+    Completable logCompletable = Completable.complete();
+    if (!event.actions().stateDelta().isEmpty()) {
+      EventData.Builder eventDataBuilder =
+          withFallbackAgent(
+              EventData.builder()
+                  .setExtraAttributes(
+                      ImmutableMap.<String, Object>builder()
+                          .put("state_delta", event.actions().stateDelta())
+                          .put("author", event.author())
+                          .buildOrThrow()),
+              event.author());
+      logCompletable =
+          logEvent(
+              "STATE_DELTA",
+              invocationContext,
+              event.content().orElse(null),
+              Optional.of(eventDataBuilder.build()));
+    }
 
     if (event.content().isPresent() && event.content().get().parts().isPresent()) {
+      Set<String> longRunningIds = event.longRunningToolIds().orElse(ImmutableSet.of());
       for (Part part : event.content().get().parts().get()) {
-        if (part.functionCall().isPresent()
-            && HITL_EVENT_TYPES.containsKey(part.functionCall().get().name().orElse(""))) {
-          String hitlEvent = HITL_EVENT_TYPES.get(part.functionCall().get().name().get());
-          TruncationResult truncatedResult =
-              smartTruncate(part.functionCall().get().args(), config.maxContentLength());
-          logCompletable =
-              logCompletable.andThen(
-                  logEvent(
-                      hitlEvent + "_COMPLETED",
-                      invocationContext,
-                      ImmutableMap.of(
-                          "tool",
-                          part.functionCall().get().name().get(),
-                          "args",
-                          truncatedResult.node()),
-                      truncatedResult.isTruncated(),
-                      Optional.empty()));
+        if (part.functionCall().isPresent()) {
+          FunctionCall functionCall = part.functionCall().get();
+          String callName = functionCall.name().orElse("");
+          // A synthetic adk_request_* function call is the HITL *request* (the pause side), not a
+          // completion: emit the plain HITL_*_REQUEST event. The response side emits _COMPLETED.
+          if (HITL_EVENT_TYPES.containsKey(callName)) {
+            String hitlEvent = HITL_EVENT_TYPES.get(callName);
+            TruncationResult truncatedResult =
+                smartTruncate(functionCall.args(), config.maxContentLength());
+            logCompletable =
+                logCompletable.andThen(
+                    logEvent(
+                        hitlEvent,
+                        invocationContext,
+                        ImmutableMap.of("tool", callName, "args", truncatedResult.node()),
+                        truncatedResult.isTruncated(),
+                        Optional.empty()));
+          }
+          // Any long-running function call (HITL or ordinary) suspends awaiting resumption: emit
+          // a pairable TOOL_PAUSED row. pause_kind derives from the call NAME so HITL pauses read
+          // hitl_* and ordinary long-running tools read "tool"; function_call_id joins the pair
+          // to the later resumed completion row.
+          if (functionCall.id().isPresent() && longRunningIds.contains(functionCall.id().get())) {
+            TruncationResult truncatedResult =
+                smartTruncate(functionCall.args(), config.maxContentLength());
+            EventData.Builder pausedData =
+                withFallbackAgent(
+                    EventData.builder()
+                        .setExtraAttributes(
+                            ImmutableMap.<String, Object>builder()
+                                .put(
+                                    "pause_kind",
+                                    HITL_PAUSE_KIND_MAP.getOrDefault(callName, "tool"))
+                                .put("function_call_id", functionCall.id().get())
+                                .buildOrThrow()),
+                    event.author());
+            logCompletable =
+                logCompletable.andThen(
+                    logEvent(
+                        "TOOL_PAUSED",
+                        invocationContext,
+                        ImmutableMap.of("tool", callName, "args", truncatedResult.node()),
+                        truncatedResult.isTruncated(),
+                        Optional.of(pausedData.build())));
+          }
         }
         if (part.functionResponse().isPresent()
             && HITL_EVENT_TYPES.containsKey(part.functionResponse().get().name().orElse(""))) {
-          String hitlEvent = HITL_EVENT_TYPES.get(part.functionResponse().get().name().get());
+          FunctionResponse hitlResponse = part.functionResponse().get();
+          String hitlEvent = HITL_EVENT_TYPES.get(hitlResponse.name().get());
           TruncationResult truncatedResult =
-              smartTruncate(part.functionResponse().get().response(), config.maxContentLength());
+              smartTruncate(hitlResponse.response(), config.maxContentLength());
           logCompletable =
               logCompletable.andThen(
                   logEvent(
                       hitlEvent + "_COMPLETED",
                       invocationContext,
+                      // "result" matches the Python plugin's HITL completion content on BOTH
+                      // producer paths, so one event type has one queryable content shape.
                       ImmutableMap.of(
-                          "tool",
-                          part.functionResponse().get().name().get(),
-                          "response",
-                          truncatedResult.node()),
+                          "tool", hitlResponse.name().get(), "result", truncatedResult.node()),
                       truncatedResult.isTruncated(),
-                      Optional.empty()));
+                      Optional.of(
+                          EventData.builder()
+                              .setExtraAttributes(
+                                  hitlPairKeys(hitlResponse.name().get(), hitlResponse.id()))
+                              .build())));
         }
       }
     }
+
+    // --- A2A interaction logging ---
+    if (event.customMetadata().isPresent()) {
+      Map<String, Object> a2aKeys = new HashMap<>();
+      for (CustomMetadata cm : event.customMetadata().get()) {
+        if (cm.key().isPresent() && cm.key().get().startsWith(BigQueryUtils.A2A_PREFIX)) {
+          cm.stringValue().ifPresent(val -> a2aKeys.put(cm.key().get(), val));
+        }
+      }
+      if (a2aKeys.containsKey(BigQueryUtils.A2A_REQUEST_KEY)
+          || a2aKeys.containsKey(BigQueryUtils.A2A_RESPONSE_KEY)) {
+        Object responsePayload = a2aKeys.get(BigQueryUtils.A2A_RESPONSE_KEY);
+        Object contentObject = null;
+        boolean contentTruncated = false;
+        if (responsePayload != null) {
+          TruncationResult responseTruncated =
+              smartTruncate(responsePayload, config.maxContentLength());
+          contentObject = toJavaObject(responseTruncated.node());
+          contentTruncated = responseTruncated.isTruncated();
+        }
+
+        // Exclude a2a:response from a2a_metadata to save storage space and avoid duplication
+        Map<String, Object> a2aMetaKeys = new HashMap<>(a2aKeys);
+        a2aMetaKeys.remove(BigQueryUtils.A2A_RESPONSE_KEY);
+        TruncationResult a2aTruncated = smartTruncate(a2aMetaKeys, config.maxContentLength());
+
+        Map<String, Object> extraAttributes = new HashMap<>();
+        Object a2aMeta = toJavaObject(a2aTruncated.node());
+        if (a2aMeta != null) {
+          extraAttributes.put("a2a_metadata", a2aMeta);
+        }
+
+        logCompletable =
+            logCompletable.andThen(
+                logEvent(
+                    "A2A_INTERACTION",
+                    invocationContext,
+                    contentObject,
+                    a2aTruncated.isTruncated() || contentTruncated,
+                    Optional.of(
+                        withFallbackAgent(
+                                EventData.builder().setExtraAttributes(extraAttributes),
+                                event.author())
+                            .build())));
+      }
+    }
+
+    // --- Final agent response logging ---
+    if (isFinalAgentResponse(event)) {
+      List<Part> visibleParts = new ArrayList<>();
+      for (Part part : event.content().get().parts().get()) {
+        if (part.text().isPresent() && !part.thought().orElse(false)) {
+          visibleParts.add(part);
+        }
+      }
+      if (!visibleParts.isEmpty()) {
+        Content visibleContent =
+            Content.builder()
+                .role(event.content().get().role().orElse("model"))
+                .parts(visibleParts)
+                .build();
+
+        Map<String, Object> extraAttributes = new HashMap<>();
+        if (event.id() != null) {
+          extraAttributes.put("source_event_id", event.id());
+        }
+        if (event.author() != null) {
+          extraAttributes.put("source_event_author", event.author());
+        }
+        event.branch().ifPresent(branch -> extraAttributes.put("source_event_branch", branch));
+
+        logCompletable =
+            logCompletable.andThen(
+                logEvent(
+                    "AGENT_RESPONSE",
+                    invocationContext,
+                    visibleContent,
+                    false,
+                    Optional.of(
+                        withFallbackAgent(
+                                EventData.builder().setExtraAttributes(extraAttributes),
+                                event.author())
+                            .build())));
+      }
+    }
+
     return logCompletable.andThen(Maybe.empty());
   }
 
@@ -515,7 +864,7 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
             "INVOCATION_COMPLETED",
             invocationContext,
             null,
-            getCompletedEventData(invocationContext))
+            getCompletedEventData(invocationContext, "invocation"))
         .andThen(state.ensureInvocationCompleted(invocationContext.invocationId()));
   }
 
@@ -526,7 +875,7 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     }
     state
         .getTraceManager(callbackContext.invocationContext().invocationId())
-        .pushSpan("agent:" + agent.name());
+        .pushSpan(callbackContext.invocationContext(), "agent:" + agent.name());
     return logEvent("AGENT_STARTING", callbackContext.invocationContext(), null, Optional.empty())
         .andThen(Maybe.empty());
   }
@@ -537,7 +886,7 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
             "AGENT_COMPLETED",
             callbackContext.invocationContext(),
             null,
-            getCompletedEventData(callbackContext.invocationContext()))
+            getCompletedEventData(callbackContext.invocationContext(), "agent:"))
         .andThen(Maybe.empty());
   }
 
@@ -613,7 +962,7 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
         EventData.builder().setModel(req.model().orElse("")).setExtraAttributes(attributes).build();
     state
         .getTraceManager(callbackContext.invocationContext().invocationId())
-        .pushSpan("llm_request");
+        .pushSpan(callbackContext.invocationContext(), "llm_request");
     return logEvent("LLM_REQUEST", callbackContext.invocationContext(), req, Optional.of(eventData))
         .andThen(Maybe.empty());
   }
@@ -635,11 +984,14 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
               usage.promptTokenCount().ifPresent(c -> usageDict.put("prompt", c));
               usage.candidatesTokenCount().ifPresent(c -> usageDict.put("completion", c));
               usage.totalTokenCount().ifPresent(c -> usageDict.put("total", c));
+              usage
+                  .cachedContentTokenCount()
+                  .ifPresent(c -> usageDict.put("cached_content_token_count", c));
             });
 
     InvocationContext invocationContext = callbackContext.invocationContext();
-    Optional<String> spanId = traceManager.getCurrentSpanId();
-    SpanIds spanIds = traceManager.getCurrentSpanAndParent();
+    Optional<String> spanId = traceManager.getCurrentSpanId(invocationContext);
+    SpanIds spanIds = traceManager.getCurrentSpanAndParent(invocationContext);
     String parentSpanId = spanIds.parentSpanId().orElse(null);
 
     boolean isPopped = false;
@@ -664,7 +1016,7 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
       }
     } else {
       // Final response - pop span
-      Optional<RecordData> popped = traceManager.popSpan();
+      Optional<RecordData> popped = traceManager.popSpan(invocationContext, "llm_request");
       if (popped.isPresent()) {
         spanId = Optional.of(popped.get().spanId());
         duration = popped.get().duration();
@@ -672,8 +1024,9 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
       }
     }
 
-    boolean hasAmbient = traceManager.hasAmbientSpan();
-    boolean useOverride = isPopped && !hasAmbient;
+    // Always record the internal execution-tree span for the final response so parent_span_id
+    // references a logged row, regardless of any ambient OpenTelemetry span.
+    boolean useOverride = isPopped;
 
     EventData.Builder eventDataBuilder = EventData.builder();
     if (!duration.isZero()) {
@@ -715,25 +1068,23 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     TraceManager traceManager =
         state.getTraceManager(callbackContext.invocationContext().invocationId());
     InvocationContext invocationContext = callbackContext.invocationContext();
-    Optional<RecordData> popped = traceManager.popSpan();
+    Optional<RecordData> popped = traceManager.popSpan(invocationContext, "llm_request");
     String spanId = popped.map(RecordData::spanId).orElse(null);
 
-    SpanIds spanIds = traceManager.getCurrentSpanAndParent();
+    SpanIds spanIds = traceManager.getCurrentSpanAndParent(invocationContext);
     String parentSpanId = spanIds.spanId().orElse(null);
 
-    boolean hasAmbient = traceManager.hasAmbientSpan();
     EventData.Builder eventDataBuilder =
         EventData.builder().setStatus("ERROR").setErrorMessage(error.getMessage());
     if (popped.isPresent()) {
       eventDataBuilder.setLatency(popped.get().duration());
     }
-    if (!hasAmbient) {
-      if (spanId != null) {
-        eventDataBuilder.setSpanIdOverride(spanId);
-      }
-      if (parentSpanId != null) {
-        eventDataBuilder.setParentSpanIdOverride(parentSpanId);
-      }
+    // Always record the internal execution-tree span so parent_span_id references a logged row.
+    if (spanId != null) {
+      eventDataBuilder.setSpanIdOverride(spanId);
+    }
+    if (parentSpanId != null) {
+      eventDataBuilder.setParentSpanIdOverride(parentSpanId);
     }
     return logEvent("LLM_ERROR", invocationContext, null, Optional.of(eventDataBuilder.build()))
         .andThen(Maybe.empty());
@@ -747,8 +1098,23 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
     }
     ImmutableMap<String, Object> contentMap =
         ImmutableMap.of("tool_origin", getToolOrigin(tool), "tool", tool.name(), "args", toolArgs);
-    state.getTraceManager(toolContext.invocationContext().invocationId()).pushSpan("tool");
-    return logEvent("TOOL_STARTING", toolContext.invocationContext(), contentMap, Optional.empty())
+    // Push with the function-call identity: ADK executes an event's function calls concurrently by
+    // default within one branch, so tool spans are created, stamped, and popped by operation
+    // identity rather than stack position. Stamp the row directly from the pushed record so a
+    // sibling tool pushing in between cannot divert the row's span IDs.
+    TraceManager.SpanRecord toolSpan =
+        state
+            .getTraceManager(toolContext.invocationContext().invocationId())
+            .pushSpanRecord(toolContext.invocationContext(), "tool", toolOperationId(toolContext));
+    EventData.Builder startingData = EventData.builder().setSpanIdOverride(toolSpan.spanId());
+    if (toolSpan.parentSpanId() != null) {
+      startingData.setParentSpanIdOverride(toolSpan.parentSpanId());
+    }
+    return logEvent(
+            "TOOL_STARTING",
+            toolContext.invocationContext(),
+            contentMap,
+            Optional.of(startingData.build()))
         .andThen(Maybe.empty());
   }
 
@@ -766,7 +1132,8 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
         .ensureInvocationSpan(toolContext.invocationContext());
     TraceManager traceManager =
         state.getTraceManager(toolContext.invocationContext().invocationId());
-    Optional<RecordData> popped = traceManager.popSpan();
+    Optional<RecordData> popped =
+        traceManager.popSpan(toolContext.invocationContext(), "tool", toolOperationId(toolContext));
     TruncationResult truncationResult = smartTruncate(result, config.maxContentLength());
     ImmutableMap<String, Object> contentMap =
         ImmutableMap.of(
@@ -777,17 +1144,15 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
             "tool_origin",
             getToolOrigin(tool));
 
-    SpanIds spanIds = traceManager.getCurrentSpanAndParent();
-    boolean hasAmbient = traceManager.hasAmbientSpan();
-
     EventData.Builder eventDataBuilder = EventData.builder();
     if (popped.isPresent()) {
       eventDataBuilder.setLatency(popped.get().duration());
     }
-    if (!hasAmbient) {
-      popped.ifPresent(p -> eventDataBuilder.setSpanIdOverride(p.spanId()));
-      spanIds.spanId().ifPresent(eventDataBuilder::setParentSpanIdOverride);
-    }
+    // Always record the internal execution-tree span so parent_span_id references a logged row.
+    // The parent comes from the popped record (captured at push time): under concurrent tool
+    // execution the branch's stack top may be a sibling tool, not this span's parent.
+    popped.ifPresent(p -> eventDataBuilder.setSpanIdOverride(p.spanId()));
+    popped.flatMap(RecordData::parentSpanId).ifPresent(eventDataBuilder::setParentSpanIdOverride);
 
     return logEvent(
             "TOOL_COMPLETED",
@@ -809,7 +1174,8 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
         .ensureInvocationSpan(toolContext.invocationContext());
     TraceManager traceManager =
         state.getTraceManager(toolContext.invocationContext().invocationId());
-    Optional<RecordData> popped = traceManager.popSpan();
+    Optional<RecordData> popped =
+        traceManager.popSpan(toolContext.invocationContext(), "tool", toolOperationId(toolContext));
 
     TruncationResult truncationResult = smartTruncate(toolArgs, config.maxContentLength());
     ImmutableMap<String, Object> contentMap =
@@ -819,18 +1185,16 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
             .put("tool_origin", getToolOrigin(tool))
             .buildOrThrow();
 
-    SpanIds spanIds = traceManager.getCurrentSpanAndParent();
-    boolean hasAmbient = traceManager.hasAmbientSpan();
-
     EventData.Builder eventDataBuilder =
         EventData.builder().setStatus("ERROR").setErrorMessage(error.getMessage());
     if (popped.isPresent()) {
       eventDataBuilder.setLatency(popped.get().duration());
     }
-    if (!hasAmbient) {
-      popped.ifPresent(p -> eventDataBuilder.setSpanIdOverride(p.spanId()));
-      spanIds.spanId().ifPresent(eventDataBuilder::setParentSpanIdOverride);
-    }
+    // Always record the internal execution-tree span so parent_span_id references a logged row.
+    // The parent comes from the popped record (captured at push time): under concurrent tool
+    // execution the branch's stack top may be a sibling tool, not this span's parent.
+    popped.ifPresent(p -> eventDataBuilder.setSpanIdOverride(p.spanId()));
+    popped.flatMap(RecordData::parentSpanId).ifPresent(eventDataBuilder::setParentSpanIdOverride);
 
     return logEvent(
             "TOOL_ERROR",
@@ -857,5 +1221,23 @@ public class BigQueryAgentAnalyticsPlugin extends BasePlugin {
       return "LOCAL";
     }
     return "UNKNOWN";
+  }
+
+  /**
+   * Returns true if the event represents a final agent response.
+   *
+   * <p>We verify finalResponse() along with empty checks for partial, function calls/responses, and
+   * long-running tool IDs. This is required because finalResponse() would otherwise return true
+   * even for thought-only, short-circuited skipSummarization() events (which ADK treats as
+   * invisible internal reasoning and should not be logged as agent responses).
+   */
+  private boolean isFinalAgentResponse(Event event) {
+    return event.content().isPresent()
+        && event.content().get().parts().isPresent()
+        && event.finalResponse()
+        && !event.partial().orElse(false)
+        && event.functionCalls().isEmpty()
+        && event.functionResponses().isEmpty()
+        && event.longRunningToolIds().map(Set::isEmpty).orElse(true);
   }
 }

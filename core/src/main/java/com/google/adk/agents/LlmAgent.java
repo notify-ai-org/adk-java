@@ -644,6 +644,44 @@ public class LlmAgent extends BaseAgent {
       }
       event.actions().stateDelta().put(outputKey().get(), output);
     }
+    List<Part> parts = event.content().flatMap(Content::parts).orElseGet(ImmutableList::of);
+
+    // Skip events with no non-thought text part (e.g. a function-call-only long-running call, or a
+    // function-response-only event) so an output value already in state is not overwritten with an
+    // empty string. Mirrors ADK Python's output_key handling.
+    boolean hasTextPart =
+        parts.stream().anyMatch(part -> !isThought(part) && part.text().isPresent());
+    if (!hasTextPart) {
+      return;
+    }
+
+    // Concatenate text from all parts, excluding thoughts.
+    String rawResult =
+        parts.stream()
+            .filter(part -> !isThought(part))
+            .map(part -> part.text().orElse(""))
+            .collect(joining());
+
+    Object output = rawResult;
+    Optional<Schema> outputSchema = outputSchema();
+    if (outputSchema.isPresent()) {
+      try {
+        output = SchemaUtils.validateOutputSchema(rawResult, outputSchema.get());
+      } catch (JsonProcessingException e) {
+        logger.error(
+            "LlmAgent output for outputKey '{}' was not valid JSON, despite an outputSchema being"
+                + " present. Saving raw output to state.",
+            outputKey().get(),
+            e);
+      } catch (IllegalArgumentException e) {
+        logger.error(
+            "LlmAgent output for outputKey '{}' did not match the outputSchema. Saving raw output"
+                + " to state.",
+            outputKey().get(),
+            e);
+      }
+    }
+    event.actions().stateDelta().put(outputKey().get(), output);
   }
 
   private static boolean isThought(Part part) {
