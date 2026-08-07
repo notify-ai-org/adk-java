@@ -257,7 +257,9 @@ public abstract class BaseLlmFlow implements BaseFlow {
                                                 agent.resolvedModel().modelName().get());
                                     LlmRequest finalLlmRequest = llmRequestBuilder.build();
 
-                                    return llm.generateContent(
+                                    return LlmRetryPolicy.execute(
+                                            context,
+                                            llm,
                                             finalLlmRequest,
                                             context.runConfig().streamingMode()
                                                 == StreamingMode.SSE)
@@ -440,13 +442,6 @@ public abstract class BaseLlmFlow implements BaseFlow {
                         if (context.endInvocation()) {
                           logger.debug("End invocation requested during preprocessing.");
                           return Flowable.empty();
-                        }
-
-                        try {
-                          context.incrementLlmCallsCount();
-                        } catch (LlmCallsLimitExceededException e) {
-                          logger.error("LLM calls limit exceeded.", e);
-                          return Flowable.error(e);
                         }
 
                         final Event mutableEventTemplate =

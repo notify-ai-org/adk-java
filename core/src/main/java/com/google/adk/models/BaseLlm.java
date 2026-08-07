@@ -17,6 +17,7 @@
 package com.google.adk.models;
 
 import io.reactivex.rxjava3.core.Flowable;
+import java.util.Set;
 
 /**
  * Abstract base class for Large Language Models (LLMs).
@@ -51,6 +52,15 @@ public abstract class BaseLlm {
    *     LlmResponses should be treated as one content by merging their parts.
    */
   public abstract Flowable<LlmResponse> generateContent(LlmRequest llmRequest, boolean stream);
+
+  /**
+   * Returns whether a provider exception represents a transient failure that may be retried.
+   *
+   * @param exception one exception in the failure's causal chain
+   * @param retryableStatusCodes HTTP status codes enabled by the run's retry configuration
+   */
+  public abstract boolean isExceptionRetryable(
+      Throwable exception, Set<Integer> retryableStatusCodes);
 
   /** Creates a live connection to the LLM. */
   public abstract BaseLlmConnection connect(LlmRequest llmRequest);

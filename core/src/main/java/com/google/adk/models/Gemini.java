@@ -25,6 +25,8 @@ import com.google.common.collect.ImmutableMap;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.genai.Client;
 import com.google.genai.ResponseStream;
+import com.google.genai.errors.ApiException;
+import com.google.genai.errors.GenAiIOException;
 import com.google.genai.types.Candidate;
 import com.google.genai.types.ClientOptions;
 import com.google.genai.types.Content;
@@ -37,14 +39,17 @@ import com.google.genai.types.LiveConnectConfig;
 import com.google.genai.types.Part;
 import com.google.genai.types.PartialArg;
 import io.reactivex.rxjava3.core.Flowable;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeoutException;
 import okhttp3.OkHttpClient;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -263,6 +268,15 @@ public class Gemini extends BaseLlm {
         return new Gemini(modelName, buildDefaultClient(httpExecutorService));
       }
     }
+  }
+
+  @Override
+  public boolean isExceptionRetryable(Throwable exception, Set<Integer> retryableStatusCodes) {
+    return exception instanceof ApiException apiException
+            && retryableStatusCodes.contains(apiException.code())
+        || exception instanceof GenAiIOException
+        || exception instanceof IOException
+        || exception instanceof TimeoutException;
   }
 
   @Override

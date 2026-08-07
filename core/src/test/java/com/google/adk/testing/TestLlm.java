@@ -26,11 +26,13 @@ import com.google.adk.models.LlmResponse;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import com.google.genai.errors.ApiException;
 import com.google.genai.types.Blob;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Flowable;
+import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -39,6 +41,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -178,6 +182,14 @@ public final class TestLlm extends BaseLlm {
   @CanIgnoreReturnValue
   public static TestLlm create(Part... responses) {
     return create(Arrays.asList(responses), null);
+  }
+
+  @Override
+  public boolean isExceptionRetryable(Throwable exception, Set<Integer> retryableStatusCodes) {
+    return exception instanceof ApiException apiException
+            && retryableStatusCodes.contains(apiException.code())
+        || exception instanceof IOException
+        || exception instanceof TimeoutException;
   }
 
   @Override

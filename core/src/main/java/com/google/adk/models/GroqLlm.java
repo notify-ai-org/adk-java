@@ -5,6 +5,7 @@ import com.openai.client.OpenAIClient;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
 import io.reactivex.rxjava3.core.Flowable;
 import java.util.Objects;
+import java.util.Set;
 
 /** OpenAI-compatible LLM provider for Groq chat completion models. */
 public final class GroqLlm extends BaseLlm {
@@ -27,6 +28,11 @@ public final class GroqLlm extends BaseLlm {
   public Flowable<LlmResponse> generateContent(LlmRequest llmRequest, boolean stream) {
     return delegate.generateContent(
         llmRequest.toBuilder().model(stripGroqPrefix(model())).build(), stream);
+  }
+
+  @Override
+  public boolean isExceptionRetryable(Throwable exception, Set<Integer> retryableStatusCodes) {
+    return delegate.isExceptionRetryable(exception, retryableStatusCodes);
   }
 
   @Override
