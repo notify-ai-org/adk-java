@@ -25,6 +25,10 @@
   <description>Google Agent Development Kit (ADK) for Java</description>
 
   <modules>
+    <!-- Keep the Notify engine in this reactor so a standalone ./mvnw build can resolve
+         google-adk's NotifyArtifactService dependency without a prior local install. The
+         workspace root reaches artifact-engine through this nested aggregator. -->
+    <module>../artifact-engine</module>
     <module>core</module>
     <module>a2a</module>
   </modules>

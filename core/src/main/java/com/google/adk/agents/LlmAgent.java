@@ -43,7 +43,6 @@ import com.google.adk.agents.Callbacks.OnToolErrorCallback;
 import com.google.adk.agents.Callbacks.OnToolErrorCallbackBase;
 import com.google.adk.agents.Callbacks.OnToolErrorCallbackSync;
 import com.google.adk.agents.ConfigAgentUtils.ConfigurationException;
-import com.google.adk.codeexecutors.BaseCodeExecutor;
 import com.google.adk.events.Event;
 import com.google.adk.flows.llmflows.AutoFlow;
 import com.google.adk.flows.llmflows.BaseLlmFlow;
@@ -111,7 +110,6 @@ public class LlmAgent extends BaseAgent {
   private final Optional<Schema> outputSchema;
   private final Optional<Executor> executor;
   private final Optional<String> outputKey;
-  private final Optional<BaseCodeExecutor> codeExecutor;
 
   private volatile Model resolvedModel;
   private final BaseLlmFlow llmFlow;
@@ -146,7 +144,6 @@ public class LlmAgent extends BaseAgent {
     this.outputKey = Optional.ofNullable(builder.outputKey);
     this.toolsUnion = requireNonNullElse(builder.toolsUnion, ImmutableList.of());
     this.toolsets = extractToolsets(this.toolsUnion);
-    this.codeExecutor = Optional.ofNullable(builder.codeExecutor);
 
     this.llmFlow = determineLlmFlow();
 
@@ -190,7 +187,6 @@ public class LlmAgent extends BaseAgent {
     private Schema outputSchema;
     private Executor executor;
     private String outputKey;
-    private BaseCodeExecutor codeExecutor;
 
     @CanIgnoreReturnValue
     public Builder model(String model) {
@@ -560,11 +556,6 @@ public class LlmAgent extends BaseAgent {
       return this;
     }
 
-    @CanIgnoreReturnValue
-    public Builder codeExecutor(BaseCodeExecutor codeExecutor) {
-      this.codeExecutor = codeExecutor;
-      return this;
-    }
 
     private static <B, A> @Nullable ImmutableList<A> convertCallbacks(
         @Nullable List<? extends B> callbacks, Function<B, A> converter, String callbackType) {
@@ -913,9 +904,6 @@ public class LlmAgent extends BaseAgent {
     return outputKey;
   }
 
-  public Optional<BaseCodeExecutor> codeExecutor() {
-    return codeExecutor;
-  }
 
   public Model resolvedModel() {
     if (resolvedModel == null) {
