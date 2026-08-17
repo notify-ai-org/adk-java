@@ -31,6 +31,19 @@
 
   <dependencies>
     <dependency>
+      <groupId>dev.notify-ai</groupId>
+      <artifactId>artifact-engine</artifactId>
+      <version>1.0.0</version>
+      <exclusions>
+        <!-- NotifyArtifactService consumes only the engine facade/model API. The host application
+             owns engine infrastructure dependencies, which must not override ADK's SDK versions. -->
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
       <groupId>com.anthropic</groupId>
       <artifactId>anthropic-java</artifactId>
     </dependency>

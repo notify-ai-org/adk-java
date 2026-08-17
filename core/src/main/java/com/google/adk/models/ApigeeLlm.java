@@ -28,9 +28,12 @@ import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.genai.Client;
 import com.google.genai.types.HttpOptions;
 import io.reactivex.rxjava3.core.Flowable;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.TimeoutException;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -407,5 +410,13 @@ public class ApigeeLlm extends BaseLlm {
     String modelPart = model.substring("apigee/".length());
     String[] components = modelPart.split("/", -1);
     return components[components.length - 1];
+  }
+
+  @Override
+  public boolean isExceptionRetryable(Throwable exception, Set<Integer> retryableStatusCodes) {
+    if (geminiDelegate != null) {
+      return geminiDelegate.isExceptionRetryable(exception, retryableStatusCodes);
+    }
+    return exception instanceof IOException || exception instanceof TimeoutException;
   }
 }

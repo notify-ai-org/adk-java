@@ -14,6 +14,9 @@ import com.google.genai.types.Part;
 import com.openai.client.OpenAIClient;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.core.JsonValue;
+import com.openai.errors.OpenAIIoException;
+import com.openai.errors.OpenAIRetryableException;
+import com.openai.errors.OpenAIServiceException;
 import com.openai.models.FunctionDefinition;
 import com.openai.models.FunctionParameters;
 import com.openai.models.chat.completions.ChatCompletion;
@@ -29,6 +32,7 @@ import com.openai.models.chat.completions.ChatCompletionToolChoiceOption;
 import com.openai.models.chat.completions.ChatCompletionToolMessageParam;
 import com.openai.models.chat.completions.ChatCompletionUserMessageParam;
 import io.reactivex.rxjava3.core.Flowable;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -37,6 +41,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -502,5 +507,15 @@ public class OpenAILlm extends BaseLlm {
   @Override
   public BaseLlmConnection connect(LlmRequest llmRequest) {
     throw new UnsupportedOperationException("Live connection is not supported for OpenAI models.");
+  }
+
+  @Override
+  public boolean isExceptionRetryable(Throwable exception, Set<Integer> retryableStatusCodes) {
+    return exception instanceof OpenAIServiceException serviceException
+            && retryableStatusCodes.contains(serviceException.statusCode())
+        || exception instanceof OpenAIIoException
+        || exception instanceof OpenAIRetryableException
+        || exception instanceof IOException
+        || exception instanceof TimeoutException;
   }
 }

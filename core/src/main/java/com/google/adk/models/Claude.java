@@ -17,6 +17,9 @@
 package com.google.adk.models;
 
 import com.anthropic.client.AnthropicClient;
+import com.anthropic.errors.AnthropicIoException;
+import com.anthropic.errors.AnthropicRetryableException;
+import com.anthropic.errors.AnthropicServiceException;
 import com.anthropic.models.messages.ContentBlock;
 import com.anthropic.models.messages.ContentBlockParam;
 import com.anthropic.models.messages.Message;
@@ -36,6 +39,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.genai.types.*;
 import io.reactivex.rxjava3.core.Flowable;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -43,6 +47,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -394,5 +400,15 @@ public class Claude extends BaseLlm {
   @Override
   public BaseLlmConnection connect(LlmRequest llmRequest) {
     throw new UnsupportedOperationException("Live connection is not supported for Claude models.");
+  }
+
+  @Override
+  public boolean isExceptionRetryable(Throwable exception, Set<Integer> retryableStatusCodes) {
+    return exception instanceof AnthropicServiceException serviceException
+            && retryableStatusCodes.contains(serviceException.statusCode())
+        || exception instanceof AnthropicIoException
+        || exception instanceof AnthropicRetryableException
+        || exception instanceof IOException
+        || exception instanceof TimeoutException;
   }
 }

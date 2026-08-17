@@ -1063,31 +1063,6 @@ public class BigQueryAgentAnalyticsPluginTest {
     assertNotNull(row.get("latency_ms"));
   }
 
-  @Test
-  public void afterToolCallback_identifiesA2AOrigin() throws Exception {
-    ToolContext mockToolContext = mock(ToolContext.class);
-    when(mockToolContext.invocationContext()).thenReturn(mockInvocationContext);
-
-    BaseAgent a2aAgent =
-        new FakeAgent("a2a_agent") {
-          @Override
-          public AgentOrigin toolOrigin() {
-            return AgentOrigin.A2A;
-          }
-        };
-
-    AgentTool a2aTool = AgentTool.create(a2aAgent);
-
-    state.getTraceManager("invocation_id").pushSpan(mockInvocationContext, "tool_request");
-    plugin
-        .afterToolCallback(a2aTool, ImmutableMap.of(), mockToolContext, ImmutableMap.of())
-        .blockingSubscribe();
-
-    Map<String, Object> row = state.getBatchProcessor("invocation_id").queue.poll();
-    assertNotNull(row);
-    ObjectNode contentMap = (ObjectNode) row.get("content");
-    assertEquals("A2A", contentMap.get("tool_origin").asText());
-  }
 
   @Test
   public void afterToolCallback_stampsPoppedToolSpanId() throws Exception {

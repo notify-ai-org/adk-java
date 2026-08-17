@@ -32,11 +32,10 @@ public class SingleFlow extends BaseLlmFlow {
           new Instructions(),
           new Identity(),
           new Compaction(),
-          new Contents(),
-          CodeExecution.requestProcessor);
+          new Contents());
 
   protected static final ImmutableList<ResponseProcessor> RESPONSE_PROCESSORS =
-      ImmutableList.of(CodeExecution.responseProcessor);
+      ImmutableList.of();
 
   public SingleFlow() {
     this(/* maxSteps= */ Optional.empty());
