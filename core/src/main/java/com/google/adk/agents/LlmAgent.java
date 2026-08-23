@@ -556,7 +556,6 @@ public class LlmAgent extends BaseAgent {
       return this;
     }
 
-
     private static <B, A> @Nullable ImmutableList<A> convertCallbacks(
         @Nullable List<? extends B> callbacks, Function<B, A> converter, String callbackType) {
       return Optional.ofNullable(callbacks)
@@ -903,7 +902,6 @@ public class LlmAgent extends BaseAgent {
   public Optional<String> outputKey() {
     return outputKey;
   }
-
 
   public Model resolvedModel() {
     if (resolvedModel == null) {

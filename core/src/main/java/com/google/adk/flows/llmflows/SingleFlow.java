@@ -34,8 +34,7 @@ public class SingleFlow extends BaseLlmFlow {
           new Compaction(),
           new Contents());
 
-  protected static final ImmutableList<ResponseProcessor> RESPONSE_PROCESSORS =
-      ImmutableList.of();
+  protected static final ImmutableList<ResponseProcessor> RESPONSE_PROCESSORS = ImmutableList.of();
 
   public SingleFlow() {
     this(/* maxSteps= */ Optional.empty());

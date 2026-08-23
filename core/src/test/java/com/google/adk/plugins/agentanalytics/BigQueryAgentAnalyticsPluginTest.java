@@ -46,10 +46,8 @@ import com.google.adk.events.EventActions;
 import com.google.adk.models.LlmRequest;
 import com.google.adk.models.LlmResponse;
 import com.google.adk.sessions.Session;
-import com.google.adk.tools.AgentTool;
 import com.google.adk.tools.BaseTool;
 import com.google.adk.tools.ToolContext;
-import com.google.adk.utils.AgentEnums.AgentOrigin;
 import com.google.api.core.ApiFutures;
 import com.google.auth.Credentials;
 import com.google.cloud.bigquery.BigQuery;
@@ -1062,7 +1060,6 @@ public class BigQueryAgentAnalyticsPluginTest {
     assertEquals(false, row.get("is_truncated"));
     assertNotNull(row.get("latency_ms"));
   }
-
 
   @Test
   public void afterToolCallback_stampsPoppedToolSpanId() throws Exception {
