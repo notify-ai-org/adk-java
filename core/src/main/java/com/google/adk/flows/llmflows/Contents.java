@@ -81,7 +81,10 @@ public final class Contents implements RequestProcessor {
       ImmutableList<Content> currentTurnContents =
           includeCurrentUserContent(
               getCurrentTurnContents(
-                  context.branch().orElse(null), sessionEvents, context.agent().name(), false),
+                  context.branch().orElse(null),
+                  sessionEvents,
+                  context.agent().name(),
+                  groupFunctionResponses),
               context.userContent());
       return Single.just(
           RequestProcessor.RequestProcessingResult.create(
@@ -91,7 +94,10 @@ public final class Contents implements RequestProcessor {
     ImmutableList<Content> contents =
         includeCurrentUserContent(
             getContents(
-                context.branch().orElse(null), sessionEvents, context.agent().name(), false),
+                context.branch().orElse(null),
+                sessionEvents,
+                context.agent().name(),
+                groupFunctionResponses),
             context.userContent());
 
     return Single.just(

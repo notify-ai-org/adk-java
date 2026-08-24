@@ -601,38 +601,8 @@ public class LlmAgent extends BaseAgent {
   }
 
   private void maybeSaveOutputToState(Event event) {
-    if (outputKey().isPresent() && event.finalResponse() && event.content().isPresent()) {
-      // Concatenate text from all parts, excluding thoughts.
-      Object output;
-      String rawResult =
-          event.content().flatMap(Content::parts).orElseGet(ImmutableList::of).stream()
-              .filter(part -> !isThought(part))
-              .map(part -> part.text().orElse(""))
-              .collect(joining());
-
-      Optional<Schema> outputSchema = outputSchema();
-      if (outputSchema.isPresent()) {
-        try {
-          output = SchemaUtils.validateOutputSchemaValue(rawResult, outputSchema.get());
-        } catch (JsonProcessingException e) {
-          logger.error(
-              "LlmAgent output for outputKey '{}' was not valid JSON, despite an outputSchema being"
-                  + " present. Saving raw output to state.",
-              outputKey().get(),
-              e);
-          output = rawResult;
-        } catch (IllegalArgumentException e) {
-          logger.error(
-              "LlmAgent output for outputKey '{}' did not match the outputSchema. Saving raw output"
-                  + " to state.",
-              outputKey().get(),
-              e);
-          output = rawResult;
-        }
-      } else {
-        output = rawResult;
-      }
-      event.actions().stateDelta().put(outputKey().get(), output);
+    if (outputKey().isEmpty() || !event.finalResponse() || event.content().isEmpty()) {
+      return;
     }
     List<Part> parts = event.content().flatMap(Content::parts).orElseGet(ImmutableList::of);
 
