@@ -165,7 +165,7 @@ public class OpenAILlm extends BaseLlm {
 
     if (!tools.isEmpty()) {
       paramsBuilder.tools(tools);
-      paramsBuilder.toolChoice(ChatCompletionToolChoiceOption.Auto.AUTO);
+      paramsBuilder.toolChoice(toolChoice(llmRequest));
       paramsBuilder.parallelToolCalls(false);
     }
 
@@ -174,6 +174,23 @@ public class OpenAILlm extends BaseLlm {
     logger.debug("OpenAI response: {}", completion);
 
     return Flowable.just(convertOpenAIResponseToLlmResponse(completion));
+  }
+
+  static ChatCompletionToolChoiceOption toolChoice(LlmRequest llmRequest) {
+    Optional<com.google.genai.types.FunctionCallingConfig> functionConfig =
+        llmRequest
+            .config()
+            .flatMap(GenerateContentConfig::toolConfig)
+            .flatMap(com.google.genai.types.ToolConfig::functionCallingConfig);
+    if (functionConfig.isEmpty() || functionConfig.get().mode().isEmpty()) {
+      return ChatCompletionToolChoiceOption.ofAuto(ChatCompletionToolChoiceOption.Auto.AUTO);
+    }
+    return switch (functionConfig.get().mode().get().knownEnum()) {
+      case ANY ->
+          ChatCompletionToolChoiceOption.ofAuto(ChatCompletionToolChoiceOption.Auto.REQUIRED);
+      case NONE -> ChatCompletionToolChoiceOption.ofAuto(ChatCompletionToolChoiceOption.Auto.NONE);
+      default -> ChatCompletionToolChoiceOption.ofAuto(ChatCompletionToolChoiceOption.Auto.AUTO);
+    };
   }
 
   private ChatCompletionMessageParam contentToOpenAIMessageParam(Content content) {
