@@ -3,15 +3,20 @@ package com.google.adk.models;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.openai.client.OpenAIClient;
 import com.openai.client.okhttp.OpenAIOkHttpClient;
+import com.openai.errors.BadRequestException;
 import io.reactivex.rxjava3.core.Flowable;
 import java.util.Objects;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** OpenAI-compatible LLM provider for Groq chat completion models. */
 public final class GroqLlm extends BaseLlm {
 
   private static final String GROQ_MODEL_PREFIX = "groq/";
   private static final String DEFAULT_BASE_URL = "https://api.groq.com/openai/v1";
+  private static final String TOOL_USE_FAILED = "tool_use_failed";
+  private static final Logger logger = LoggerFactory.getLogger(GroqLlm.class);
   private final OpenAILlm delegate;
 
   private GroqLlm(String model, OpenAIClient client) {
@@ -32,7 +37,21 @@ public final class GroqLlm extends BaseLlm {
 
   @Override
   public boolean isExceptionRetryable(Throwable exception, Set<Integer> retryableStatusCodes) {
+    if (isToolUseFailed(exception)) {
+      // Groq rejects tool calls the model emitted with malformed JSON; a fresh sample usually
+      // succeeds.
+      logger.warn(
+          "Groq tool_use_failed for model={}: {}",
+          model(),
+          ((BadRequestException) exception).body());
+      return true;
+    }
     return delegate.isExceptionRetryable(exception, retryableStatusCodes);
+  }
+
+  private static boolean isToolUseFailed(Throwable exception) {
+    return exception instanceof BadRequestException badRequest
+        && badRequest.code().filter(TOOL_USE_FAILED::equals).isPresent();
   }
 
   @Override
