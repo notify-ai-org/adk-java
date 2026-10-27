@@ -21,6 +21,9 @@ import com.openai.models.FunctionDefinition;
 import com.openai.models.FunctionParameters;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionAssistantMessageParam;
+import com.openai.models.chat.completions.ChatCompletionContentPart;
+import com.openai.models.chat.completions.ChatCompletionContentPartImage;
+import com.openai.models.chat.completions.ChatCompletionContentPartText;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionMessage;
 import com.openai.models.chat.completions.ChatCompletionMessageFunctionToolCall;
@@ -34,6 +37,7 @@ import com.openai.models.chat.completions.ChatCompletionUserMessageParam;
 import io.reactivex.rxjava3.core.Flowable;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -252,11 +256,52 @@ public class OpenAILlm extends BaseLlm {
       return List.of(
           ChatCompletionMessageParam.ofAssistant(
               ChatCompletionAssistantMessageParam.builder().content(textContent).build()));
+    } else if (parts.stream().anyMatch(OpenAILlm::isInlineImage)) {
+      return List.of(
+          ChatCompletionMessageParam.ofUser(
+              ChatCompletionUserMessageParam.builder()
+                  .contentOfArrayOfContentParts(userContentParts(parts))
+                  .build()));
     } else {
       return List.of(
           ChatCompletionMessageParam.ofUser(
               ChatCompletionUserMessageParam.builder().content(textContent).build()));
     }
+  }
+
+  /** Text and inline images in their original order; images are sent as base64 data URIs. */
+  private static List<ChatCompletionContentPart> userContentParts(List<Part> parts) {
+    List<ChatCompletionContentPart> content = new ArrayList<>();
+    for (Part part : parts) {
+      if (part.text().isPresent() && !part.text().get().isEmpty()) {
+        content.add(
+            ChatCompletionContentPart.ofText(
+                ChatCompletionContentPartText.builder().text(part.text().get()).build()));
+      } else if (isInlineImage(part)) {
+        var blob = part.inlineData().get();
+        String dataUri =
+            "data:"
+                + blob.mimeType().get()
+                + ";base64,"
+                + Base64.getEncoder().encodeToString(blob.data().get());
+        content.add(
+            ChatCompletionContentPart.ofImageUrl(
+                ChatCompletionContentPartImage.builder()
+                    .imageUrl(
+                        ChatCompletionContentPartImage.ImageUrl.builder()
+                            .url(dataUri)
+                            .detail(ChatCompletionContentPartImage.ImageUrl.Detail.AUTO)
+                            .build())
+                    .build()));
+      }
+    }
+    return content;
+  }
+
+  private static boolean isInlineImage(Part part) {
+    return part.inlineData().isPresent()
+        && part.inlineData().get().data().isPresent()
+        && part.inlineData().get().mimeType().map(type -> type.startsWith("image/")).orElse(false);
   }
 
   private boolean hasFunctionCall(Content content) {
